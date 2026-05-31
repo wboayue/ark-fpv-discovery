@@ -70,11 +70,9 @@ mod app {
     use super::*;
 
     // Status LED indices into `Local::leds` — ARK FPV board pins PE3/PE4/PE5.
-    // See docs/ark-fpv-board.md. Red/blue are wired but not yet driven.
-    #[allow(dead_code)]
+    // See docs/ark-fpv-board.md. log_tick cycles through them red→green→blue.
     const LED_RED: usize = 0;
     const LED_GREEN: usize = 1;
-    #[allow(dead_code)]
     const LED_BLUE: usize = 2;
 
     #[shared]
@@ -181,9 +179,15 @@ mod app {
 
     #[task(shared = [serial], local = [counter, leds])]
     async fn log_tick(mut cx: log_tick::Context) {
+        // Cycle order: red → green → blue, one lit per tick.
+        const SEQUENCE: [usize; 3] = [LED_RED, LED_GREEN, LED_BLUE];
+
         loop {
-            // Heartbeat: blink the green LED once per tick.
-            cx.local.leds[LED_GREEN].toggle();
+            // Light only the LED for this step (active-low: LOW = lit), others off.
+            let step = (*cx.local.counter as usize) % SEQUENCE.len();
+            for (i, led) in cx.local.leds.iter_mut().enumerate() {
+                led.set_state(PinState::from(SEQUENCE[step] != i));
+            }
 
             let mut msg: String<64> = String::new();
 
