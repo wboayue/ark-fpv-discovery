@@ -72,6 +72,14 @@ mod app {
     use super::*;
     use crate::imu::Imu;
 
+    /// Lock the shared USB serial port and write `msg`. Generic over the RTIC resource
+    /// proxy so every task shares one code path. Best-effort: write errors are dropped.
+    fn write_serial(serial: &mut impl rtic::Mutex<T = SerialPort<'static, UsbBus<USB2>>>, msg: &str) {
+        serial.lock(|serial| {
+            let _ = serial.write(msg.as_bytes());
+        });
+    }
+
     // Status LED indices into `Local::leds` — ARK FPV board pins PE3/PE4/PE5.
     // See docs/ark-fpv-board.md. log_tick cycles through them red→green→blue.
     const LED_RED: usize = 0;
@@ -224,9 +232,7 @@ mod app {
             )
             .ok();
 
-            cx.shared.serial.lock(|serial| {
-                let _ = serial.write(msg.as_bytes());
-            });
+            write_serial(&mut cx.shared.serial, &msg);
 
             *cx.local.counter = cx.local.counter.wrapping_add(1);
 
@@ -248,9 +254,7 @@ mod app {
             crate::imu::EXPECTED_WHO_AM_I
         )
         .ok();
-        cx.shared.serial.lock(|serial| {
-            let _ = serial.write(msg.as_bytes());
-        });
+        write_serial(&mut cx.shared.serial, &msg);
 
         // Reset to a known state, then configure and let the gyro start.
         imu.soft_reset();
@@ -275,9 +279,7 @@ mod app {
             )
             .ok();
 
-            cx.shared.serial.lock(|serial| {
-                let _ = serial.write(msg.as_bytes());
-            });
+            write_serial(&mut cx.shared.serial, &msg);
 
             Mono::delay(100.millis()).await;
         }
