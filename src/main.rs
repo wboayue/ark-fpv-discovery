@@ -9,6 +9,7 @@ use stm32h7xx_hal as hal;
 use core::fmt::Write;
 
 use hal::{
+    gpio::{ErasedPin, Output, PushPull},
     pac,
     prelude::*,
     rcc::rec::UsbClkSel,
@@ -30,6 +31,14 @@ systick_monotonic!(Mono, 1_000);
 mod app {
     use super::*;
 
+    // Status LED indices into `Local::leds` — ARK FPV board pins PE3/PE4/PE5.
+    // See docs/ark-fpv-board.md. Red/blue are wired but not yet driven.
+    #[allow(dead_code)]
+    const LED_RED: usize = 0;
+    const LED_GREEN: usize = 1;
+    #[allow(dead_code)]
+    const LED_BLUE: usize = 2;
+
     #[shared]
     struct Shared {
         usb_dev: UsbDevice<'static, UsbBus<USB2>>,
@@ -39,6 +48,7 @@ mod app {
     #[local]
     struct Local {
         counter: u32,
+        leds: [ErasedPin<Output<PushPull>>; 3],
     }
 
     #[init(local = [
@@ -62,6 +72,16 @@ mod app {
         ccdr.peripheral.kernel_usb_clk_mux(UsbClkSel::Hsi48);
 
         let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
+        let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
+
+        // Status LEDs: red=PE3, green=PE4, blue=PE5. Start off (default low).
+        // Polarity is undocumented upstream; the heartbeat uses toggle(), so only
+        // the initial state assumes active-high — flip if the board is active-low.
+        let leds = [
+            gpioe.pe3.into_push_pull_output().erase(),
+            gpioe.pe4.into_push_pull_output().erase(),
+            gpioe.pe5.into_push_pull_output().erase(),
+        ];
 
         // PA11 = USB DM, PA12 = USB DP
         let usb_dm = gpioa.pa11.into_alternate();
@@ -98,7 +118,7 @@ mod app {
 
         (
             Shared { usb_dev, serial },
-            Local { counter: 0 },
+            Local { counter: 0, leds },
         )
     }
 
@@ -111,9 +131,12 @@ mod app {
         });
     }
 
-    #[task(shared = [serial], local = [counter])]
+    #[task(shared = [serial], local = [counter, leds])]
     async fn log_tick(mut cx: log_tick::Context) {
         loop {
+            // Heartbeat: blink the green LED once per tick.
+            cx.local.leds[LED_GREEN].toggle();
+
             let mut msg: String<64> = String::new();
 
             write!(
