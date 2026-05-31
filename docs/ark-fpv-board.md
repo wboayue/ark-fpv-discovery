@@ -51,7 +51,7 @@ trusting any single line; the two upstreams occasionally disagree (noted inline)
 | Green | `PE4` |
 | Blue | `PE5` |
 
-Active state not documented upstream; confirm polarity on first bring-up.
+**Active-low** (confirmed on hardware): driving the pin LOW lights the LED, HIGH turns it off.
 
 ## Beeper / buzzer
 

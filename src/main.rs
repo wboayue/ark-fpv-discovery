@@ -9,7 +9,7 @@ use stm32h7xx_hal as hal;
 use core::fmt::Write;
 
 use hal::{
-    gpio::{ErasedPin, Output, PushPull},
+    gpio::{ErasedPin, Output, PinState, PushPull},
     pac,
     prelude::*,
     rcc::rec::UsbClkSel,
@@ -74,13 +74,12 @@ mod app {
         let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
         let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
 
-        // Status LEDs: red=PE3, green=PE4, blue=PE5. Start off (default low).
-        // Polarity is undocumented upstream; the heartbeat uses toggle(), so only
-        // the initial state assumes active-high — flip if the board is active-low.
+        // Status LEDs: red=PE3, green=PE4, blue=PE5. These are active-low on the
+        // ARK FPV (pin LOW = lit), so start all three HIGH (off). log_tick blinks green.
         let leds = [
-            gpioe.pe3.into_push_pull_output().erase(),
-            gpioe.pe4.into_push_pull_output().erase(),
-            gpioe.pe5.into_push_pull_output().erase(),
+            gpioe.pe3.into_push_pull_output_in_state(PinState::High).erase(),
+            gpioe.pe4.into_push_pull_output_in_state(PinState::High).erase(),
+            gpioe.pe5.into_push_pull_output_in_state(PinState::High).erase(),
         ];
 
         // PA11 = USB DM, PA12 = USB DP
