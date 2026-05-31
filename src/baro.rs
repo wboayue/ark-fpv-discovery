@@ -32,12 +32,78 @@ const CMD_SOFT_RESET: u8 = 0xB6;
 pub const CHIP_ID_BMP388: u8 = 0x50;
 pub const CHIP_ID_BMP390: u8 = 0x60;
 
-// Config: normal mode, pressure ×8 / temperature ×1 oversampling, ODR ≈ 12.5 Hz.
 // PWR_CTRL layout (datasheet / bmp3_defs.h): mode in bits[5:4] (normal=0b11), temp_en bit1,
 // press_en bit0. So 0x33 = (0b11<<4) | temp_en | press_en. (NOT 0x0F — mode is not bits[1:0].)
 const PWR_CTRL_NORMAL: u8 = 0x33;
-const OSR_P8_T1: u8 = 0x03; // osr_t ×1 (bits[5:3]=000) | osr_p ×8 (bits[2:0]=011)
-const ODR_12_5HZ: u8 = 0x04;
+
+// Bosch meas-time constants (bmp3_defs.h): t_meas ≈ 234 + (392 + 2^osr_p·2000) +
+// (313 + 2^osr_t·2000) µs. Config is valid iff t_meas < the ODR period.
+const SETTLE_PRESS_US: u32 = 392;
+const SETTLE_TEMP_US: u32 = 313;
+const ADC_CONV_US: u32 = 2000;
+const MEAS_BASE_US: u32 = 234;
+
+/// Output data rate (`ODR` register `0x1D`). Coupled to oversampling by the timing rule above.
+#[derive(Clone, Copy)]
+pub enum BaroOdr {
+    Hz200,
+    Hz100,
+    Hz50,
+    Hz25,
+    Hz12_5,
+}
+
+impl BaroOdr {
+    const fn reg(self) -> u8 {
+        match self {
+            BaroOdr::Hz200 => 0x00,
+            BaroOdr::Hz100 => 0x01,
+            BaroOdr::Hz50 => 0x02,
+            BaroOdr::Hz25 => 0x03,
+            BaroOdr::Hz12_5 => 0x04,
+        }
+    }
+
+    const fn period_us(self) -> u32 {
+        match self {
+            BaroOdr::Hz200 => 5_000,
+            BaroOdr::Hz100 => 10_000,
+            BaroOdr::Hz50 => 20_000,
+            BaroOdr::Hz25 => 40_000,
+            BaroOdr::Hz12_5 => 80_000,
+        }
+    }
+}
+
+/// Oversampling factor (`OSR` register fields). Value is the register code; `factor = 1 << code`.
+#[derive(Clone, Copy)]
+pub enum Oversampling {
+    X1,
+    X2,
+    X4,
+    X8,
+    X16,
+    X32,
+}
+
+impl Oversampling {
+    const fn reg(self) -> u8 {
+        match self {
+            Oversampling::X1 => 0,
+            Oversampling::X2 => 1,
+            Oversampling::X4 => 2,
+            Oversampling::X8 => 3,
+            Oversampling::X16 => 4,
+            Oversampling::X32 => 5,
+        }
+    }
+}
+
+/// `configure` rejects an ODR too fast for the chosen oversampling (Bosch timing rule).
+#[derive(Debug)]
+pub enum ConfigError {
+    OdrTooFast,
+}
 
 /// One compensated sample.
 pub struct BaroSample {
@@ -139,12 +205,25 @@ impl Baro {
         };
     }
 
-    /// Set oversampling/ODR and start normal-mode sampling. Caller must wait for the first
-    /// conversion (~tens of ms) before reading.
-    pub fn configure(&mut self) {
-        self.write_reg(REG_OSR, OSR_P8_T1);
-        self.write_reg(REG_ODR, ODR_12_5HZ);
+    /// Set oversampling/ODR and start normal-mode sampling. Returns `Err(OdrTooFast)` if the
+    /// measurement can't complete within the ODR period (Bosch timing rule) — the registers are
+    /// left untouched in that case. Caller must wait for the first conversion before reading.
+    pub fn configure(
+        &mut self,
+        odr: BaroOdr,
+        osr_p: Oversampling,
+        osr_t: Oversampling,
+    ) -> Result<(), ConfigError> {
+        let meas_us = MEAS_BASE_US
+            + (SETTLE_PRESS_US + (1 << osr_p.reg()) * ADC_CONV_US)
+            + (SETTLE_TEMP_US + (1 << osr_t.reg()) * ADC_CONV_US);
+        if meas_us >= odr.period_us() {
+            return Err(ConfigError::OdrTooFast);
+        }
+        self.write_reg(REG_OSR, (osr_t.reg() << 3) | osr_p.reg());
+        self.write_reg(REG_ODR, odr.reg());
         self.write_reg(REG_PWR_CTRL, PWR_CTRL_NORMAL);
+        Ok(())
     }
 
     /// Read the latest sample and apply Bosch float compensation.
