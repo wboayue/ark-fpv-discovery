@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, reads the **IIM-42653 IMU over SPI1** (`src/imu.rs`) and streams scaled accel/gyro/temp at 10 Hz, and emits a `tick` counter line once per second.
+`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, reads the **IIM-42653 IMU over SPI1** (`src/imu.rs`, 10 Hz) and the **BMP388/BMP390 barometer over I2C2** (`src/baro.rs`, ~2 Hz), streams their readings, and emits a `tick` counter line once per second.
 
 Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller. The `stm32h743v` HAL feature and the `memory.x` layout below are chosen to match its MCU. Full pin map (sensors, LEDs, UARTs, motor outputs, ADC) is in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
@@ -74,6 +74,18 @@ First sensor brought up. Polled register-level driver, no external crate. Things
 - Data is big-endian; burst-read `0x1D..=0x2A` (TEMP, ACCEL XYZ, GYRO XYZ) in one transaction. Soft-reset (DEVICE_CONFIG `0x11` = `0x01`) on startup gives a known state across our frequent reboots; wait ~2 ms after, then ~50 ms after `configure()` for the gyro to start.
 - DRDY (`PF2`, EXTI) is **not** used — `imu_sample` just polls at 10 Hz. Wiring it up is a future step.
 - Sanity check on hardware: accel vector magnitude ≈ 1 g at rest, gyro ≈ 0 dps.
+
+## Sensors — BMP388/BMP390 barometer (`src/baro.rs`)
+
+Second sensor. Inline I2C2 driver, no external crate. Things that bite:
+
+- **I2C2 has NO kernel-clock trap** (unlike SPI1's PLL1_Q): I2C123 runs off `pclk1` (APB1), always live after `freeze()`. No rcc change needed.
+- Pins SCL `PF1` / SDA `PF0` must be **AF4 open-drain** — use `into_alternate_open_drain::<4>()`, **not** `into_alternate::<4>()` (push-pull won't satisfy the `Pins<I2C2>` bound; it's a compile error, so at least it fails loud).
+- Address `0x76`. CHIP_ID (`0x00`) = `0x50` (BMP388) or `0x60` (BMP390) — accept either.
+- **PWR_CTRL (`0x1B`): `mode` is bits[5:4]** (normal = `0b11`), press_en bit0, temp_en bit1 → normal+both = **`0x33`**. NOT `0x0F` — that puts mode=`00`=sleep, and the bug is silent: in sleep the data registers return their reset default `0x800000`, which *compensates to a believable ~23 °C / ~817 hPa that never changes*. If baro readings are plausible but frozen, suspect the mode bits. (Verified the layout against Bosch `bmp3_defs.h`: `BMP3_OP_MODE_MSK 0x30`, pos 4.)
+- Calibration: burst-read the 21-byte NVM block at `0x31..=0x45`, parse with the datasheet signedness (P5/P6 are u16; most other P's are i8/i16), and scale each coefficient by its power-of-two divisor (Bosch `parse_calib_data`). Compensation uses **f64** (matches the Bosch double API; only integer powers, so no `libm`).
+- Data: 6 bytes from `0x04`, little-endian (XLSB/LSB/MSB), pressure then temperature.
+- Sanity check on hardware: pressure ≈ 950–1030 hPa; temperature reads the sensor's *local* board temp (runs well above ambient near the H7 — ~50 °C observed), and breathing on the board swings it noticeably (toward breath temp).
 
 ## Reboot to DFU (`r` command)
 

@@ -17,18 +17,21 @@ Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
 ## Current state
 
-The transport, dev loop, and the first sensor are up.
+The transport, dev loop, and the first two sensors are up.
 
 - Enumerates as a USB CDC serial device; readings stream out over it.
 - **IIM-42653 IMU on SPI1** (`src/imu.rs`): brought up over SPI1 (SCK `PA5` / MISO `PG9` /
   MOSI `PB5`, soft CS `PI9`, MODE_3), WHO_AM_I-verified (`0x56`), gyro+accel in Low-Noise mode at
   ±16g / ±2000 dps, 1 kHz. Streams scaled accel (g) / gyro (dps) / temp (°C) at 10 Hz. Polled;
   the DRDY interrupt (`PF2`) is not used yet.
+- **BMP388/BMP390 barometer on I2C2** (`src/baro.rs`): brought up over I2C2 (SCL `PF1` / SDA `PF0`,
+  AF4 open-drain) at address `0x76`, CHIP_ID-checked (`0x50`/`0x60`), normal-mode sampling at
+  pressure ×8 / temp ×1. Reads the factory NVM calibration and applies the Bosch float
+  compensation; streams pressure (hPa) / temperature (°C) at ~2 Hz. Polled.
 - Streams a `tick` counter line once per second and cycles the status LEDs red → green → blue
   (one per tick) as a heartbeat.
 - Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing.
-- **Roadmap:** barometer (BMP388/390 on I2C2) and magnetometer (IIS2MDC/LIS2MDL on I2C4), then
-  sensor fusion.
+- **Roadmap:** magnetometer (IIS2MDC/LIS2MDL on I2C4), then sensor fusion.
 
 ## Hardware
 
@@ -85,7 +88,9 @@ red → green → blue in sync.
 
 | Path                     | What                                             |
 | ------------------------ | ------------------------------------------------ |
-| `src/main.rs`            | The whole firmware — one `#[rtic::app]` module   |
+| `src/main.rs`            | The `#[rtic::app]` module — init, tasks, peripheral wiring |
+| `src/imu.rs`             | IIM-42653 IMU driver (SPI1)                       |
+| `src/baro.rs`            | BMP388/BMP390 barometer driver (I2C2)             |
 | `memory.x`               | Linker regions: FLASH @ `0x08000000`, RAM @ `0x20000000` |
 | `.cargo/config.toml`     | Target + linker args                             |
 | `docs/ark-fpv-board.md`  | ARK FPV pin map                                  |
@@ -93,3 +98,19 @@ red → green → blue in sync.
 
 See [`CLAUDE.md`](CLAUDE.md) for the hard-won details (USB clock path, reboot-to-DFU mechanism,
 `pre_init` pitfall, RTIC resource conventions).
+
+## References
+
+Datasheets and reference drivers the sensor code is built from:
+
+- **Barometer (BMP388/BMP390)** — Bosch
+  [BMP388 datasheet](https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp388-ds001.pdf)
+  and [BMP390 datasheet](https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp390-ds002.pdf)
+  (register map, CHIP_ID, PWR_CTRL/OSR bit fields), and the Bosch
+  [BMP3_SensorAPI](https://github.com/boschsensortec/BMP3_SensorAPI) — source of the NVM
+  calibration scaling and float compensation in `src/baro.rs`.
+- **IMU (IIM-42653)** — TDK
+  [IIM-42653 datasheet](https://invensense.tdk.com/products/smartindustrial/iim-42653/)
+  and Betaflight
+  [`accgyro_mpu.h`](https://github.com/betaflight/betaflight/blob/master/src/main/drivers/accgyro/accgyro_mpu.h)
+  — source of the WHO_AM_I value (`0x56`) used in `src/imu.rs`.
