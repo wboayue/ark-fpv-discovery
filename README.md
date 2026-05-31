@@ -17,13 +17,18 @@ Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
 ## Current state
 
-The transport and dev-loop scaffolding is up; sensor drivers are the next step.
+The transport, dev loop, and the first sensor are up.
 
-- Enumerates as a USB CDC serial device and streams a `tick` counter line once per second —
-  this is the channel sensor readings will flow out over.
-- Cycles the onboard status LEDs red → green → blue (one per tick) as a heartbeat.
+- Enumerates as a USB CDC serial device; readings stream out over it.
+- **IIM-42653 IMU on SPI1** (`src/imu.rs`): brought up over SPI1 (SCK `PA5` / MISO `PG9` /
+  MOSI `PB5`, soft CS `PI9`, MODE_3), WHO_AM_I-verified (`0x56`), gyro+accel in Low-Noise mode at
+  ±16g / ±2000 dps, 1 kHz. Streams scaled accel (g) / gyro (dps) / temp (°C) at 10 Hz. Polled;
+  the DRDY interrupt (`PF2`) is not used yet.
+- Streams a `tick` counter line once per second and cycles the status LEDs red → green → blue
+  (one per tick) as a heartbeat.
 - Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing.
-- **No sensors are read yet** — IMU/baro/mag bring-up over SPI1 / I2C2 / I2C4 is the roadmap.
+- **Roadmap:** barometer (BMP388/390 on I2C2) and magnetometer (IIS2MDC/LIS2MDL on I2C4), then
+  sensor fusion.
 
 ## Hardware
 

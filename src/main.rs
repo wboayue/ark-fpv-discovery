@@ -3,6 +3,8 @@
 
 use panic_halt as _;
 
+mod imu;
+
 use heapless::String;
 use stm32h7xx_hal as hal;
 
@@ -68,6 +70,7 @@ fn maybe_enter_bootloader() {
 #[rtic::app(device = stm32h7xx_hal::pac, peripherals = true, dispatchers = [FDCAN1_IT0])]
 mod app {
     use super::*;
+    use crate::imu::Imu;
 
     // Status LED indices into `Local::leds` — ARK FPV board pins PE3/PE4/PE5.
     // See docs/ark-fpv-board.md. log_tick cycles through them red→green→blue.
@@ -85,6 +88,7 @@ mod app {
     struct Local {
         counter: u32,
         leds: [ErasedPin<Output<PushPull>>; 3],
+        imu: Imu,
     }
 
     #[init(local = [
@@ -103,15 +107,21 @@ mod app {
 
         let rcc = dp.RCC.constrain();
 
+        // pll1_q_ck must be enabled: it's SPI1's kernel clock, which the HAL .expect()s when
+        // building the SPI (otherwise `init` panics → no CDC). Independent of the HSI48 USB path.
         let mut ccdr = rcc
             .sys_ck(400.MHz())
+            .pll1_q_ck(80.MHz())
             .freeze(vos, &dp.SYSCFG);
 
         let _ = ccdr.clocks.hsi48_ck().expect("HSI48 must run");
         ccdr.peripheral.kernel_usb_clk_mux(UsbClkSel::Hsi48);
 
         let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
+        let gpiob = dp.GPIOB.split(ccdr.peripheral.GPIOB);
         let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
+        let gpiog = dp.GPIOG.split(ccdr.peripheral.GPIOG);
+        let gpioi = dp.GPIOI.split(ccdr.peripheral.GPIOI);
 
         // Status LEDs: red=PE3, green=PE4, blue=PE5. These are active-low on the
         // ARK FPV (pin LOW = lit), so start all three HIGH (off). log_tick blinks green.
@@ -120,6 +130,21 @@ mod app {
             gpioe.pe4.into_push_pull_output_in_state(PinState::High).erase(),
             gpioe.pe5.into_push_pull_output_in_state(PinState::High).erase(),
         ];
+
+        // IIM-42653 IMU on SPI1: SCK=PA5, MISO=PG9, MOSI=PB5 (all AF5), soft CS=PI9.
+        // MODE_3 (CPOL=1, CPHA=1); ~8 MHz, well under the 24 MHz max.
+        let spi = dp.SPI1.spi(
+            (
+                gpioa.pa5.into_alternate::<5>(),
+                gpiog.pg9.into_alternate::<5>(),
+                gpiob.pb5.into_alternate::<5>(),
+            ),
+            hal::spi::MODE_3,
+            8.MHz(),
+            ccdr.peripheral.SPI1,
+            &ccdr.clocks,
+        );
+        let imu = Imu::new(spi, gpioi.pi9.into_push_pull_output().erase());
 
         // PA11 = USB DM, PA12 = USB DP
         let usb_dm = gpioa.pa11.into_alternate();
@@ -153,10 +178,11 @@ mod app {
         .build();
 
         log_tick::spawn().ok();
+        imu_sample::spawn().ok();
 
         (
             Shared { usb_dev, serial },
-            Local { counter: 0, leds },
+            Local { counter: 0, leds, imu },
         )
     }
 
@@ -205,6 +231,55 @@ mod app {
             *cx.local.counter = cx.local.counter.wrapping_add(1);
 
             Mono::delay(1_000.millis()).await;
+        }
+    }
+
+    // Bring up the IIM-42653 and stream scaled accel/gyro/temp at 10 Hz.
+    #[task(shared = [serial], local = [imu])]
+    async fn imu_sample(mut cx: imu_sample::Context) {
+        let imu = cx.local.imu;
+
+        let id = imu.who_am_i();
+        let mut msg: String<128> = String::new();
+        write!(
+            &mut msg,
+            "imu WHO_AM_I=0x{:02x} (expect {:02x})\r\n",
+            id,
+            crate::imu::EXPECTED_WHO_AM_I
+        )
+        .ok();
+        cx.shared.serial.lock(|serial| {
+            let _ = serial.write(msg.as_bytes());
+        });
+
+        // Reset to a known state, then configure and let the gyro start.
+        imu.soft_reset();
+        Mono::delay(2.millis()).await;
+        imu.configure();
+        Mono::delay(50.millis()).await;
+
+        loop {
+            let s = imu.read();
+
+            let mut msg: String<128> = String::new();
+            write!(
+                &mut msg,
+                "imu accel[g]={:.2},{:.2},{:.2} gyro[dps]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
+                s.accel_g[0],
+                s.accel_g[1],
+                s.accel_g[2],
+                s.gyro_dps[0],
+                s.gyro_dps[1],
+                s.gyro_dps[2],
+                s.temp_c
+            )
+            .ok();
+
+            cx.shared.serial.lock(|serial| {
+                let _ = serial.write(msg.as_bytes());
+            });
+
+            Mono::delay(100.millis()).await;
         }
     }
 }
