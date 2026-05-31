@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target/
+
+# Backtrace/debug
+*.rs.bk
+
+# Compiled firmware binaries
+*.bin
+*.elf
+*.hex
+
+# OS / editor
+.DS_Store

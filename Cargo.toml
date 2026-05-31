@@ -1,0 +1,22 @@
+[package]
+name = "ark-discovery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+rtic = { version = "2.2", features = ["thumbv7-backend"] }
+rtic-monotonics = { version = "2.0", features = ["cortex-m-systick"] }
+
+stm32h7xx-hal = { version = "0.16", features = [
+  "stm32h743v",
+  "rt",
+  "usb_hs"
+] }
+
+usb-device = "0.3"
+usbd-serial = "0.2"
+heapless = "0.8"
