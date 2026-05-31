@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device and emits a `tick` counter line once per second.
+`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, reads the **IIM-42653 IMU over SPI1** (`src/imu.rs`) and streams scaled accel/gyro/temp at 10 Hz, and emits a `tick` counter line once per second.
 
 Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller. The `stm32h743v` HAL feature and the `memory.x` layout below are chosen to match its MCU. Full pin map (sensors, LEDs, UARTs, motor outputs, ADC) is in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
@@ -55,12 +55,25 @@ Everything lives in one `#[rtic::app]` module — there is no `main()`. Key conv
 - **`#[shared]` resources** (`usb_dev`, `serial`) are accessed only inside `.lock(|r| ...)` closures; RTIC enforces this for data-race freedom across priorities.
 - **`#[local]` resources** belong to exactly one task (e.g. `counter` in `log_tick`).
 - **`#[init]` local statics** (`ep_mem`, `usb_bus`) give `'static` backing storage for the USB allocator — the `usb_bus: Option<...> = None` + `.replace()` dance exists because the `SerialPort`/`UsbDevice` borrow from a bus that must outlive `init`.
-- **Tasks**: `usb_irq` is hardware-bound (`binds = OTG_FS`) — it pumps `usb_dev.poll` and reads the CDC RX, where a `b'r'` byte triggers the reboot-to-DFU. `log_tick` is an `async` software task that loops with `Mono::delay(...).await` and toggles the green LED each tick. The `dispatchers = [FDCAN1_IT0]` list donates an unused interrupt vector for RTIC to run software tasks — add more dispatchers if you add more software-task priority levels.
+- **Tasks**: `usb_irq` is hardware-bound (`binds = OTG_FS`) — it pumps `usb_dev.poll` and reads the CDC RX, where a `b'r'` byte triggers the reboot-to-DFU. `log_tick` and `imu_sample` are `async` software tasks that loop with `Mono::delay(...).await`; `log_tick` cycles the LEDs and emits the tick line, `imu_sample` reads the IMU at 10 Hz. Both share `serial`. The `dispatchers = [FDCAN1_IT0]` list donates an unused interrupt vector for RTIC to run software tasks (one dispatcher is enough while they all sit at the same priority) — add more dispatchers if you add more software-task priority levels.
 - Timebase is SysTick via `systick_monotonic!(Mono, 1_000)` (1 kHz tick), started in `init` with the 400 MHz core clock.
 
 ## Status LEDs
 
 Red `PE3` / green `PE4` / blue `PE5` (GPIOE), stored as an erased-pin array in `Local`. **Active-low** (confirmed on hardware): pin LOW = lit, HIGH = off. Configure with `into_push_pull_output_in_state(PinState::High)` to start off. `log_tick` blinks green as a heartbeat. Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
+
+## Sensors — IIM-42653 IMU (`src/imu.rs`)
+
+First sensor brought up. Polled register-level driver, no external crate. Things that bite:
+
+- **SPI1 needs `pll1_q_ck` enabled in the rcc chain** (`.sys_ck(400.MHz()).pll1_q_ck(80.MHz())`). PLL1_Q is SPI1's kernel clock and the HAL `.expect()`s it when building the SPI — without it `init` **panics** (which looks exactly like a hung boot: no CDC). Independent of the HSI48 USB path.
+- Pins: SCK `PA5` / MISO `PG9` / MOSI `PB5`, all **AF5** (`into_alternate::<5>()`); soft CS `PI9` driven as GPIO (active-low). **MODE_3** (CPOL=1, CPHA=1), ~8 MHz (24 MHz max). Reads use `reg | 0x80`.
+- **WHO_AM_I (`0x75`) = `0x56`** for the IIM-42653 — *not* the ICM-42688's `0x47`. `EXPECTED_WHO_AM_I` in `imu.rs`.
+- **PWR_MGMT0 (`0x4E`) = `0x0F`**: GYRO_MODE bits[3:2] + ACCEL_MODE bits[1:0], both `0b11` = Low-Noise.
+- **The IIM-42653 is the wide-range part (±32g / ±4000 dps), so its FS_SEL table is shifted up one step vs the ICM-42688**: `FS_SEL=000` = max range here. We select `FS_SEL=001` → ±16g / ±2000 dps, giving the standard 2048 LSB/g and 16.384 LSB/dps. Scaling constants depend on the selected range — change the range, change the constants.
+- Data is big-endian; burst-read `0x1D..=0x2A` (TEMP, ACCEL XYZ, GYRO XYZ) in one transaction. Soft-reset (DEVICE_CONFIG `0x11` = `0x01`) on startup gives a known state across our frequent reboots; wait ~2 ms after, then ~50 ms after `configure()` for the gyro to start.
+- DRDY (`PF2`, EXTI) is **not** used — `imu_sample` just polls at 10 Hz. Wiring it up is a future step.
+- Sanity check on hardware: accel vector magnitude ≈ 1 g at rest, gyro ≈ 0 dps.
 
 ## Reboot to DFU (`r` command)
 
