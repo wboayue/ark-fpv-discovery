@@ -27,6 +27,44 @@ use rtic_monotonics::systick::prelude::*;
 
 systick_monotonic!(Mono, 1_000);
 
+// --- Reboot-to-DFU support ----------------------------------------------------
+// Sending 'r' over the USB serial link reboots the board into the STM32 ROM
+// bootloader, so it can be reflashed with dfu-util without touching BOOT0/RESET.
+
+/// Written to `BOOT_FLAG` to request a ROM-bootloader jump on the next boot.
+const BOOTLOADER_MAGIC: u32 = 0xB007_0DF1;
+/// STM32H743 system-memory (ROM) bootloader entry vector — see ST AN2606.
+const SYSTEM_BOOTLOADER: *const u32 = 0x1FF0_9800 as *const u32;
+
+/// Lives in `.uninit`, which cortex-m-rt does NOT zero, so it survives the soft
+/// reset that carries the request from the running app into `pre_init`.
+#[link_section = ".uninit.BOOT_FLAG"]
+static mut BOOT_FLAG: core::mem::MaybeUninit<u32> = core::mem::MaybeUninit::uninit();
+
+#[inline(always)]
+fn boot_flag() -> *mut u32 {
+    core::ptr::addr_of_mut!(BOOT_FLAG).cast()
+}
+
+/// Flag a bootloader jump and reset. The jump itself happens at the top of `init`,
+/// after the reset, while clocks are still at their reset defaults.
+fn reboot_to_bootloader() -> ! {
+    unsafe { boot_flag().write_volatile(BOOTLOADER_MAGIC) };
+    cortex_m::peripheral::SCB::sys_reset();
+}
+
+/// If a reboot-to-DFU was requested before the last reset, enter the ROM bootloader.
+/// Call this as the very first thing in `init`, before touching any peripheral/clock.
+#[inline(always)]
+fn maybe_enter_bootloader() {
+    unsafe {
+        if boot_flag().read_volatile() == BOOTLOADER_MAGIC {
+            boot_flag().write_volatile(0);
+            cortex_m::asm::bootload(SYSTEM_BOOTLOADER);
+        }
+    }
+}
+
 #[rtic::app(device = stm32h7xx_hal::pac, peripherals = true, dispatchers = [FDCAN1_IT0])]
 mod app {
     use super::*;
@@ -56,6 +94,9 @@ mod app {
         usb_bus: Option<UsbBusAllocator<UsbBus<USB2>>> = None,
     ])]
     fn init(cx: init::Context) -> (Shared, Local) {
+        // Honor a pending reboot-to-DFU request before configuring anything.
+        maybe_enter_bootloader();
+
         let dp: pac::Peripherals = cx.device;
         Mono::start(cx.core.SYST, 400_000_000);
 
@@ -125,7 +166,15 @@ mod app {
     fn usb_irq(mut cx: usb_irq::Context) {
         cx.shared.usb_dev.lock(|usb_dev| {
             cx.shared.serial.lock(|serial| {
-                usb_dev.poll(&mut [serial]);
+                if usb_dev.poll(&mut [serial]) {
+                    // 'r' reboots into the ROM bootloader for dfu-util flashing.
+                    let mut buf = [0u8; 32];
+                    if let Ok(n) = serial.read(&mut buf) {
+                        if buf[..n].contains(&b'r') {
+                            reboot_to_bootloader();
+                        }
+                    }
+                }
             });
         });
     }
