@@ -10,6 +10,8 @@ Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight control
 
 ## Build & flash
 
+Common flows are wrapped in a `justfile` — `just dfu flash` (reboot to DFU, then flash), `just monitor` (read serial), `just reboot`, `just --list` for all. The raw commands below explain what each step does and remain the source of truth for the gotchas.
+
 Target and linker args are fixed in `.cargo/config.toml` (`thumbv7em-none-eabihf`, `-Tlink.x`), so plain cargo works:
 
 ```bash
