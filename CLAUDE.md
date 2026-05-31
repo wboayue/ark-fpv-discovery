@@ -8,6 +8,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller. The `stm32h743v` HAL feature and the `memory.x` layout below are chosen to match its MCU. Full pin map (sensors, LEDs, UARTs, motor outputs, ADC) is in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
+## Always document sources
+
+This is a hardware-bring-up project: nearly every magic number is a register address, bit field, or coefficient from a datasheet or reference driver — and they are easy to get subtly wrong (we've been bitten by hallucinated/transposed values more than once). So **always cite where a value came from**:
+
+- **In code**, put a comment next to any non-obvious constant naming its source (datasheet section, or a reputable driver — e.g. PX4 `InvenSense_ICM42688P_registers.hpp`, Bosch `BMP3_SensorAPI`, Betaflight). See `src/imu.rs` / `src/baro.rs` for the style.
+- **In the README `## References` section**, list the authoritative source per sensor/subsystem, with a link.
+- **Vendor the datasheet** into [`docs/datasheets/`](docs/datasheets/) when the PDF is freely downloadable; link it when it's gated.
+- **Prefer primary sources** (datasheet, vendor reference driver) over forum posts or a model's recollection, and when sources disagree, note which you trusted and why. Verify a flagged value before flashing.
+
 ## Build & flash
 
 Common flows are wrapped in a `justfile` — `just dfu flash` (reboot to DFU, then flash), `just monitor` (read serial), `just reboot`, `just --list` for all. The raw commands below explain what each step does and remain the source of truth for the gotchas.
