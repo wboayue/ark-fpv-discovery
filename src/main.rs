@@ -3,6 +3,7 @@
 
 use panic_halt as _;
 
+mod baro;
 mod imu;
 
 use heapless::String;
@@ -70,6 +71,7 @@ fn maybe_enter_bootloader() {
 #[rtic::app(device = stm32h7xx_hal::pac, peripherals = true, dispatchers = [FDCAN1_IT0])]
 mod app {
     use super::*;
+    use crate::baro::{Baro, CHIP_ID_BMP388, CHIP_ID_BMP390};
     use crate::imu::Imu;
 
     /// Lock the shared USB serial port and write `msg`. Generic over the RTIC resource
@@ -97,6 +99,7 @@ mod app {
         counter: u32,
         leds: [ErasedPin<Output<PushPull>>; 3],
         imu: Imu,
+        baro: Baro,
     }
 
     #[init(local = [
@@ -128,6 +131,7 @@ mod app {
         let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
         let gpiob = dp.GPIOB.split(ccdr.peripheral.GPIOB);
         let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
+        let gpiof = dp.GPIOF.split(ccdr.peripheral.GPIOF);
         let gpiog = dp.GPIOG.split(ccdr.peripheral.GPIOG);
         let gpioi = dp.GPIOI.split(ccdr.peripheral.GPIOI);
 
@@ -153,6 +157,19 @@ mod app {
             &ccdr.clocks,
         );
         let imu = Imu::new(spi, gpioi.pi9.into_push_pull_output().erase());
+
+        // BMP388/BMP390 barometer on I2C2: SCL=PF1, SDA=PF0 (AF4, open-drain). No kernel-clock
+        // setup needed — I2C123 runs off PCLK1, which is always live after freeze().
+        let i2c = dp.I2C2.i2c(
+            (
+                gpiof.pf1.into_alternate_open_drain::<4>(),
+                gpiof.pf0.into_alternate_open_drain::<4>(),
+            ),
+            400.kHz(),
+            ccdr.peripheral.I2C2,
+            &ccdr.clocks,
+        );
+        let baro = Baro::new(i2c);
 
         // PA11 = USB DM, PA12 = USB DP
         let usb_dm = gpioa.pa11.into_alternate();
@@ -187,10 +204,11 @@ mod app {
 
         log_tick::spawn().ok();
         imu_sample::spawn().ok();
+        baro_sample::spawn().ok();
 
         (
             Shared { usb_dev, serial },
-            Local { counter: 0, leds, imu },
+            Local { counter: 0, leds, imu, baro },
         )
     }
 
@@ -282,6 +300,45 @@ mod app {
             write_serial(&mut cx.shared.serial, &msg);
 
             Mono::delay(100.millis()).await;
+        }
+    }
+
+    // Bring up the BMP388/BMP390 barometer and stream pressure/temp at ~2 Hz.
+    #[task(shared = [serial], local = [baro])]
+    async fn baro_sample(mut cx: baro_sample::Context) {
+        let baro = cx.local.baro;
+
+        let id = baro.chip_id();
+        let part = match id {
+            CHIP_ID_BMP388 => "BMP388",
+            CHIP_ID_BMP390 => "BMP390",
+            _ => "unknown",
+        };
+        let mut msg: String<128> = String::new();
+        write!(&mut msg, "baro CHIP_ID=0x{:02x} ({})\r\n", id, part).ok();
+        write_serial(&mut cx.shared.serial, &msg);
+
+        // Reset, read factory calibration, then start normal-mode sampling.
+        baro.soft_reset();
+        Mono::delay(5.millis()).await;
+        baro.read_calibration();
+        baro.configure();
+        Mono::delay(50.millis()).await;
+
+        loop {
+            let s = baro.read();
+
+            let mut msg: String<128> = String::new();
+            write!(
+                &mut msg,
+                "baro press={:.2}hPa temp={:.2}C\r\n",
+                s.pressure_hpa, s.temp_c
+            )
+            .ok();
+
+            write_serial(&mut cx.shared.serial, &msg);
+
+            Mono::delay(500.millis()).await;
         }
     }
 }
