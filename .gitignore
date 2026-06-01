@@ -11,3 +11,6 @@
 
 # OS / editor
 .DS_Store
+
+# Local Claude Code harness state
+.claude/
