@@ -11,7 +11,11 @@
 //!   <https://github.com/STMicroelectronics/lis2mdl-pid/blob/master/lis2mdl_reg.h>
 //!   <https://github.com/STMicroelectronics/lis2mdl-pid/blob/master/lis2mdl_reg.c>
 
-use stm32h7xx_hal::{self as hal, prelude::*};
+use core::future::Future;
+
+use stm32h7xx_hal as hal;
+
+use crate::i2c_regs::I2cRegs;
 
 type I2c4 = hal::i2c::I2c<hal::pac::I2C4>;
 
@@ -81,27 +85,27 @@ pub struct MagSample {
 }
 
 pub struct Mag {
-    i2c: I2c4,
+    regs: I2cRegs<I2c4>,
 }
 
 impl Mag {
     /// Take ownership of the configured I2C4 bus.
     pub fn new(i2c: I2c4) -> Self {
-        Self { i2c }
+        Self {
+            regs: I2cRegs::new(i2c, ADDR),
+        }
     }
 
     fn read_regs(&mut self, reg: u8, buf: &mut [u8]) {
-        let _ = self.i2c.write_read(ADDR, &[reg], buf);
+        self.regs.read_regs(reg, buf);
     }
 
     fn write_reg(&mut self, reg: u8, val: u8) {
-        let _ = self.i2c.write(ADDR, &[reg, val]);
+        self.regs.write_reg(reg, val);
     }
 
     pub fn who_am_i(&mut self) -> u8 {
-        let mut b = [0u8; 1];
-        self.read_regs(REG_WHO_AM_I, &mut b);
-        b[0]
+        self.regs.read_reg(REG_WHO_AM_I)
     }
 
     /// Soft-reset the config registers. SOFT_RST self-clears when the reset completes; the caller
@@ -131,6 +135,35 @@ impl Mag {
         self.start_continuous(odr);
     }
 
+    /// Full polled bring-up: soft-reset, wait for it to self-clear, configure, then re-assert
+    /// continuous mode until it latches. Owns the two chip quirks the task shouldn't know about —
+    /// the reset must finalize before configuring, and the first continuous write after reset
+    /// often reverts MD to idle (see [`soft_reset`](Self::soft_reset) / [`configure`]). The caller
+    /// supplies an async millisecond delay (e.g. `|ms| Mono::delay(ms.millis())`). Returns `true`
+    /// once continuous conversion is confirmed running, `false` if it never latched.
+    pub async fn bring_up<F, Fut>(&mut self, odr: MagOdr, mut delay_ms: F) -> bool
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.soft_reset();
+        for _ in 0..10 {
+            delay_ms(2).await;
+            if self.reset_complete() {
+                break;
+            }
+        }
+        self.configure(odr);
+        for _ in 0..10 {
+            delay_ms(10).await;
+            if self.is_continuous() {
+                return true;
+            }
+            self.start_continuous(odr);
+        }
+        false
+    }
+
     /// Write CFG_REG_A = temperature-compensation + ODR + continuous mode. Idempotent; safe to
     /// call repeatedly to re-assert continuous mode until it latches (see [`configure`]).
     pub fn start_continuous(&mut self, odr: MagOdr) {
@@ -149,9 +182,7 @@ impl Mag {
 
     /// Raw STATUS_REG (`0x67`).
     pub fn status(&mut self) -> u8 {
-        let mut b = [0u8; 1];
-        self.read_regs(REG_STATUS, &mut b);
-        b[0]
+        self.regs.read_reg(REG_STATUS)
     }
 
     /// Read back the three config registers (CFG_A, CFG_B, CFG_C) for bring-up diagnostics.

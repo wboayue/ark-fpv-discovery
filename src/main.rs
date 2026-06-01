@@ -5,6 +5,7 @@ use panic_halt as _;
 
 mod baro;
 mod config;
+mod i2c_regs;
 mod imu;
 mod mag;
 
@@ -99,6 +100,23 @@ mod app {
         serial.lock(|serial| {
             let _ = serial.write(msg.as_bytes());
         });
+    }
+
+    /// Longest formatted log line we emit (the verbose mag diagnostic dump); sizes the buffer.
+    const LOG_LINE_CAP: usize = 192;
+
+    /// Format and write one line to the shared serial port. Collapses the repeated
+    /// `String::new()` / `write!` / `write_serial` boilerplate, owning the one buffer size so call
+    /// sites carry no magic number. Best-effort: a line longer than `LOG_LINE_CAP` is truncated and
+    /// write errors are dropped. Pass the message with `format_args!`, e.g.
+    /// `log_fmt(&mut cx.shared.serial, format_args!("tick {}", n))`.
+    fn log_fmt(
+        serial: &mut impl rtic::Mutex<T = SerialPort<'static, UsbBus<USB2>>>,
+        args: core::fmt::Arguments,
+    ) {
+        let mut msg: String<LOG_LINE_CAP> = String::new();
+        let _ = msg.write_fmt(args);
+        write_serial(serial, &msg);
     }
 
     // Status LED indices into `Local::leds` — ARK FPV board pins PE3/PE4/PE5.
@@ -297,16 +315,10 @@ mod app {
                 led.set_state(PinState::from(SEQUENCE[step] != i));
             }
 
-            let mut msg: String<64> = String::new();
-
-            write!(
-                &mut msg,
-                "hello from RTIC on STM32H743, tick {}\r\n",
-                *cx.local.counter
-            )
-            .ok();
-
-            write_serial(&mut cx.shared.serial, &msg);
+            log_fmt(
+                &mut cx.shared.serial,
+                format_args!("hello from RTIC on STM32H743, tick {}\r\n", *cx.local.counter),
+            );
 
             *cx.local.counter = cx.local.counter.wrapping_add(1);
 
@@ -335,23 +347,22 @@ mod app {
     // `n` is the DRDY count (confirms the real loop rate); `id` is the WHO_AM_I read at startup.
     #[task(shared = [serial])]
     async fn imu_log(mut cx: imu_log::Context, n: u32, id: u8, s: ImuSample) {
-        let mut msg: String<128> = String::new();
-        write!(
-            &mut msg,
-            "imu[{}] id=0x{:02x}(exp {:02x}) accel[g]={:.2},{:.2},{:.2} gyro[dps]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
-            n,
-            id,
-            crate::imu::EXPECTED_WHO_AM_I,
-            s.accel_g[0],
-            s.accel_g[1],
-            s.accel_g[2],
-            s.gyro_dps[0],
-            s.gyro_dps[1],
-            s.gyro_dps[2],
-            s.temp_c
-        )
-        .ok();
-        write_serial(&mut cx.shared.serial, &msg);
+        log_fmt(
+            &mut cx.shared.serial,
+            format_args!(
+                "imu[{}] id=0x{:02x}(exp {:02x}) accel[g]={:.2},{:.2},{:.2} gyro[dps]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
+                n,
+                id,
+                crate::imu::EXPECTED_WHO_AM_I,
+                s.accel_g[0],
+                s.accel_g[1],
+                s.accel_g[2],
+                s.gyro_dps[0],
+                s.gyro_dps[1],
+                s.gyro_dps[2],
+                s.temp_c
+            ),
+        );
     }
 
     // Bring up the BMP388/BMP390 barometer (polled) and stream pressure/temp. Sample rate and
@@ -366,24 +377,25 @@ mod app {
             CHIP_ID_BMP390 => "BMP390",
             _ => "unknown",
         };
-        let mut msg: String<128> = String::new();
-        write!(&mut msg, "baro CHIP_ID=0x{:02x} ({})\r\n", id, part).ok();
-        write_serial(&mut cx.shared.serial, &msg);
+        log_fmt(
+            &mut cx.shared.serial,
+            format_args!("baro CHIP_ID=0x{:02x} ({})\r\n", id, part),
+        );
 
-        // Reset, read factory calibration, then start normal-mode sampling at the configured rate.
-        baro.soft_reset();
-        Mono::delay(5.millis()).await;
-        baro.read_calibration();
+        // Reset, load calibration, and start normal-mode sampling (driver owns the timing).
         if baro
-            .configure(config::BARO_ODR, config::BARO_OSR_P, config::BARO_OSR_T)
+            .bring_up(config::BARO_ODR, config::BARO_OSR_P, config::BARO_OSR_T, |ms| {
+                Mono::delay(ms.millis())
+            })
+            .await
             .is_err()
         {
-            let mut msg: String<128> = String::new();
-            write!(&mut msg, "baro: invalid ODR/OSR (too fast for oversampling)\r\n").ok();
-            write_serial(&mut cx.shared.serial, &msg);
+            log_fmt(
+                &mut cx.shared.serial,
+                format_args!("baro: invalid ODR/OSR (too fast for oversampling)\r\n"),
+            );
             return;
         }
-        Mono::delay(50.millis()).await;
 
         let period = (1_000 / config::BARO_SAMPLE_HZ).millis();
         let mut n: u32 = 0;
@@ -392,14 +404,10 @@ mod app {
             n = n.wrapping_add(1);
 
             if n % config::BARO_LOG_DIV == 0 {
-                let mut msg: String<128> = String::new();
-                write!(
-                    &mut msg,
-                    "baro press={:.2}hPa temp={:.2}C\r\n",
-                    s.pressure_hpa, s.temp_c
-                )
-                .ok();
-                write_serial(&mut cx.shared.serial, &msg);
+                log_fmt(
+                    &mut cx.shared.serial,
+                    format_args!("baro press={:.2}hPa temp={:.2}C\r\n", s.pressure_hpa, s.temp_c),
+                );
             }
 
             Mono::delay(period).await;
@@ -413,44 +421,23 @@ mod app {
         let mag = cx.local.mag;
 
         let id = mag.who_am_i();
-        let mut msg: String<128> = String::new();
         let ok = if id == crate::mag::EXPECTED_WHO_AM_I { "ok" } else { "MISMATCH" };
-        write!(
-            &mut msg,
-            "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}\r\n",
-            id,
-            crate::mag::EXPECTED_WHO_AM_I,
-            ok
-        )
-        .ok();
-        write_serial(&mut cx.shared.serial, &msg);
+        log_fmt(
+            &mut cx.shared.serial,
+            format_args!(
+                "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}\r\n",
+                id,
+                crate::mag::EXPECTED_WHO_AM_I,
+                ok
+            ),
+        );
 
-        // Soft-reset, then WAIT for SOFT_RST to self-clear before configuring — otherwise the
-        // tail of the reset clobbers the MD bits and the chip stays idle (frozen data).
-        mag.soft_reset();
-        for _ in 0..10 {
-            Mono::delay(2.millis()).await;
-            if mag.reset_complete() {
-                break;
-            }
-        }
-        mag.configure(config::MAG_ODR);
-        // The first continuous-mode write after reset frequently fails to latch — the chip reverts
-        // MD to idle, leaving it idle (frozen data, temp stuck at 25 C). Re-assert until CFG_A
-        // reports continuous (observed: a second write makes it stick).
-        let mut started = false;
-        for _ in 0..10 {
-            Mono::delay(10.millis()).await;
-            if mag.is_continuous() {
-                started = true;
-                break;
-            }
-            mag.start_continuous(config::MAG_ODR);
-        }
-        if !started {
-            let mut msg: String<64> = String::new();
-            write!(&mut msg, "mag: failed to enter continuous mode\r\n").ok();
-            write_serial(&mut cx.shared.serial, &msg);
+        // Reset and enter continuous mode (driver owns the reset-wait + continuous-latch retries).
+        if !mag.bring_up(config::MAG_ODR, |ms| Mono::delay(ms.millis())).await {
+            log_fmt(
+                &mut cx.shared.serial,
+                format_args!("mag: failed to enter continuous mode\r\n"),
+            );
         }
 
         let period = (1_000 / config::MAG_SAMPLE_HZ).millis();
@@ -461,26 +448,26 @@ mod app {
             n = n.wrapping_add(1);
 
             if n % config::MAG_LOG_DIV == 0 {
-                let mut msg: String<192> = String::new();
                 if diag_enabled() {
                     // Verbose, read-only: chip ID, the three config registers, and STATUS.
                     let id = mag.who_am_i();
                     let (ca, cb, cc) = mag.read_cfg();
-                    write!(
-                        &mut msg,
-                        "mag[diag] id=0x{:02x} cfgA=0x{:02x} B=0x{:02x} C=0x{:02x} field[uT]={:.1},{:.1},{:.1} temp={:.1}C status=0x{:02x}\r\n",
-                        id, ca, cb, cc, s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c, st
-                    )
-                    .ok();
+                    log_fmt(
+                        &mut cx.shared.serial,
+                        format_args!(
+                            "mag[diag] id=0x{:02x} cfgA=0x{:02x} B=0x{:02x} C=0x{:02x} field[uT]={:.1},{:.1},{:.1} temp={:.1}C status=0x{:02x}\r\n",
+                            id, ca, cb, cc, s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c, st
+                        ),
+                    );
                 } else {
-                    write!(
-                        &mut msg,
-                        "mag field[uT]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
-                        s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c
-                    )
-                    .ok();
+                    log_fmt(
+                        &mut cx.shared.serial,
+                        format_args!(
+                            "mag field[uT]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
+                            s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c
+                        ),
+                    );
                 }
-                write_serial(&mut cx.shared.serial, &msg);
             }
 
             Mono::delay(period).await;
