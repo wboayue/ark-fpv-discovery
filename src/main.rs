@@ -4,6 +4,7 @@
 use panic_halt as _;
 
 mod baro;
+mod config;
 mod imu;
 
 use heapless::String;
@@ -12,7 +13,7 @@ use stm32h7xx_hal as hal;
 use core::fmt::Write;
 
 use hal::{
-    gpio::{ErasedPin, Output, PinState, PushPull},
+    gpio::{Edge, ErasedPin, ExtiPin, Input, Output, PinState, PushPull},
     pac,
     prelude::*,
     rcc::rec::UsbClkSel,
@@ -72,7 +73,7 @@ fn maybe_enter_bootloader() {
 mod app {
     use super::*;
     use crate::baro::{Baro, CHIP_ID_BMP388, CHIP_ID_BMP390};
-    use crate::imu::Imu;
+    use crate::imu::{Imu, ImuSample};
 
     /// Lock the shared USB serial port and write `msg`. Generic over the RTIC resource
     /// proxy so every task shares one code path. Best-effort: write errors are dropped.
@@ -99,6 +100,8 @@ mod app {
         counter: u32,
         leds: [ErasedPin<Output<PushPull>>; 3],
         imu: Imu,
+        imu_drdy: ErasedPin<Input>,
+        imu_id: u8,
         baro: Baro,
     }
 
@@ -156,7 +159,22 @@ mod app {
             ccdr.peripheral.SPI1,
             &ccdr.clocks,
         );
-        let imu = Imu::new(spi, gpioi.pi9.into_push_pull_output().erase());
+        let mut imu = Imu::new(spi, gpioi.pi9.into_push_pull_output().erase());
+        // Control-mode bring-up: reset, brief settle (~2 ms @ 400 MHz), then configure ODR,
+        // filtering, and DRDY-on-INT1. The gyro takes ~50 ms to start — DRDY simply won't fire
+        // until then, so no explicit wait is needed here.
+        imu.soft_reset();
+        cortex_m::asm::delay(800_000);
+        let imu_id = imu.who_am_i();
+        imu.configure_control_mode(config::IMU_ODR);
+
+        // IMU data-ready (INT1) → PF2 → EXTI line 2. Rising edge (INT1 is active-high push-pull).
+        let mut syscfg = dp.SYSCFG;
+        let mut exti = dp.EXTI;
+        let mut imu_drdy = gpiof.pf2.into_floating_input().erase();
+        imu_drdy.make_interrupt_source(&mut syscfg);
+        imu_drdy.trigger_on_edge(&mut exti, Edge::Rising);
+        imu_drdy.enable_interrupt(&mut exti);
 
         // BMP388/BMP390 barometer on I2C2: SCL=PF1, SDA=PF0 (AF4, open-drain). No kernel-clock
         // setup needed — I2C123 runs off PCLK1, which is always live after freeze().
@@ -203,12 +221,12 @@ mod app {
         .build();
 
         log_tick::spawn().ok();
-        imu_sample::spawn().ok();
         baro_sample::spawn().ok();
+        // The IMU loop is driven by the DRDY interrupt (EXTI2), not spawned here.
 
         (
             Shared { usb_dev, serial },
-            Local { counter: 0, leds, imu, baro },
+            Local { counter: 0, leds, imu, imu_drdy, imu_id, baro },
         )
     }
 
@@ -258,52 +276,48 @@ mod app {
         }
     }
 
-    // Bring up the IIM-42653 and stream scaled accel/gyro/temp at 10 Hz.
-    #[task(shared = [serial], local = [imu])]
-    async fn imu_sample(mut cx: imu_sample::Context) {
-        let imu = cx.local.imu;
-
-        let id = imu.who_am_i();
-        let mut msg: String<128> = String::new();
-        write!(
-            &mut msg,
-            "imu WHO_AM_I=0x{:02x} (expect {:02x})\r\n",
-            id,
-            crate::imu::EXPECTED_WHO_AM_I
-        )
-        .ok();
-        write_serial(&mut cx.shared.serial, &msg);
-
-        // Reset to a known state, then configure and let the gyro start.
-        imu.soft_reset();
-        Mono::delay(2.millis()).await;
-        imu.configure();
-        Mono::delay(50.millis()).await;
-
-        loop {
-            let s = imu.read();
-
-            let mut msg: String<128> = String::new();
-            write!(
-                &mut msg,
-                "imu accel[g]={:.2},{:.2},{:.2} gyro[dps]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
-                s.accel_g[0],
-                s.accel_g[1],
-                s.accel_g[2],
-                s.gyro_dps[0],
-                s.gyro_dps[1],
-                s.gyro_dps[2],
-                s.temp_c
-            )
-            .ok();
-
-            write_serial(&mut cx.shared.serial, &msg);
-
-            Mono::delay(100.millis()).await;
+    // Gyro-synchronous control-loop tick: fires on the IMU's data-ready interrupt (INT1 → PF2 →
+    // EXTI line 2) at the configured ODR. High priority so it preempts logging/baro/tick. The
+    // future control law runs here; for now it reads the sample and hands every Nth one to the
+    // low-priority logger so USB never gates the fast path. `n` counts DRDY events (lets us
+    // confirm the real loop rate from the logged value).
+    #[task(binds = EXTI2, priority = 2, local = [imu, imu_drdy, imu_id, n: u32 = 0])]
+    fn imu_drdy(cx: imu_drdy::Context) {
+        cx.local.imu_drdy.clear_interrupt_pending_bit();
+        let s = cx.local.imu.read();
+        cx.local.imu.clear_interrupt(); // read INT_STATUS → drop the latched INT1 line
+        // (control step goes here)
+        *cx.local.n = cx.local.n.wrapping_add(1);
+        if *cx.local.n % config::IMU_LOG_DIV == 0 {
+            imu_log::spawn(*cx.local.n, *cx.local.imu_id, s).ok();
         }
     }
 
-    // Bring up the BMP388/BMP390 barometer and stream pressure/temp at ~2 Hz.
+    // Low-priority: format an IMU sample and write it to USB serial. Decoupled from the fast loop.
+    // `n` is the DRDY count (confirms the real loop rate); `id` is the WHO_AM_I read at startup.
+    #[task(shared = [serial])]
+    async fn imu_log(mut cx: imu_log::Context, n: u32, id: u8, s: ImuSample) {
+        let mut msg: String<128> = String::new();
+        write!(
+            &mut msg,
+            "imu[{}] id=0x{:02x}(exp {:02x}) accel[g]={:.2},{:.2},{:.2} gyro[dps]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
+            n,
+            id,
+            crate::imu::EXPECTED_WHO_AM_I,
+            s.accel_g[0],
+            s.accel_g[1],
+            s.accel_g[2],
+            s.gyro_dps[0],
+            s.gyro_dps[1],
+            s.gyro_dps[2],
+            s.temp_c
+        )
+        .ok();
+        write_serial(&mut cx.shared.serial, &msg);
+    }
+
+    // Bring up the BMP388/BMP390 barometer (polled) and stream pressure/temp. Sample rate and
+    // log rate come from `config` and are decoupled (sampled fast, logged every Nth).
     #[task(shared = [serial], local = [baro])]
     async fn baro_sample(mut cx: baro_sample::Context) {
         let baro = cx.local.baro;
@@ -318,27 +332,39 @@ mod app {
         write!(&mut msg, "baro CHIP_ID=0x{:02x} ({})\r\n", id, part).ok();
         write_serial(&mut cx.shared.serial, &msg);
 
-        // Reset, read factory calibration, then start normal-mode sampling.
+        // Reset, read factory calibration, then start normal-mode sampling at the configured rate.
         baro.soft_reset();
         Mono::delay(5.millis()).await;
         baro.read_calibration();
-        baro.configure();
+        if baro
+            .configure(config::BARO_ODR, config::BARO_OSR_P, config::BARO_OSR_T)
+            .is_err()
+        {
+            let mut msg: String<128> = String::new();
+            write!(&mut msg, "baro: invalid ODR/OSR (too fast for oversampling)\r\n").ok();
+            write_serial(&mut cx.shared.serial, &msg);
+            return;
+        }
         Mono::delay(50.millis()).await;
 
+        let period = (1_000 / config::BARO_SAMPLE_HZ).millis();
+        let mut n: u32 = 0;
         loop {
             let s = baro.read();
+            n = n.wrapping_add(1);
 
-            let mut msg: String<128> = String::new();
-            write!(
-                &mut msg,
-                "baro press={:.2}hPa temp={:.2}C\r\n",
-                s.pressure_hpa, s.temp_c
-            )
-            .ok();
+            if n % config::BARO_LOG_DIV == 0 {
+                let mut msg: String<128> = String::new();
+                write!(
+                    &mut msg,
+                    "baro press={:.2}hPa temp={:.2}C\r\n",
+                    s.pressure_hpa, s.temp_c
+                )
+                .ok();
+                write_serial(&mut cx.shared.serial, &msg);
+            }
 
-            write_serial(&mut cx.shared.serial, &msg);
-
-            Mono::delay(500.millis()).await;
+            Mono::delay(period).await;
         }
     }
 }

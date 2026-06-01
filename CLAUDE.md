@@ -4,9 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, reads the **IIM-42653 IMU over SPI1** (`src/imu.rs`, 10 Hz) and the **BMP388/BMP390 barometer over I2C2** (`src/baro.rs`, ~2 Hz), streams their readings, and emits a `tick` counter line once per second.
+`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, runs a **gyro-synchronous control loop off the IIM-42653 IMU's data-ready interrupt** (`src/imu.rs`, SPI1, default 1 kHz) and polls the **BMP388/BMP390 barometer** (`src/baro.rs`, I2C2, 25 Hz), streams their readings (logging throttled, decoupled from the loop), and emits a `tick` counter line once per second. Sensor/loop rates are configured in `src/config.rs`.
 
 Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller. The `stm32h743v` HAL feature and the `memory.x` layout below are chosen to match its MCU. Full pin map (sensors, LEDs, UARTs, motor outputs, ADC) is in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
+
+## Always document sources
+
+This is a hardware-bring-up project: nearly every magic number is a register address, bit field, or coefficient from a datasheet or reference driver — and they are easy to get subtly wrong (we've been bitten by hallucinated/transposed values more than once). So **always cite where a value came from**:
+
+- **In code**, put a comment next to any non-obvious constant naming its source (datasheet section, or a reputable driver — e.g. PX4 `InvenSense_ICM42688P_registers.hpp`, Bosch `BMP3_SensorAPI`, Betaflight). See `src/imu.rs` / `src/baro.rs` for the style.
+- **In the README `## References` section**, list the authoritative source per sensor/subsystem, with a link.
+- **Vendor the datasheet** into [`docs/datasheets/`](docs/datasheets/) when the PDF is freely downloadable; link it when it's gated.
+- **Prefer primary sources** (datasheet, vendor reference driver) over forum posts or a model's recollection, and when sources disagree, note which you trusted and why. Verify a flagged value before flashing.
 
 ## Build & flash
 
@@ -55,7 +64,7 @@ Everything lives in one `#[rtic::app]` module — there is no `main()`. Key conv
 - **`#[shared]` resources** (`usb_dev`, `serial`) are accessed only inside `.lock(|r| ...)` closures; RTIC enforces this for data-race freedom across priorities.
 - **`#[local]` resources** belong to exactly one task (e.g. `counter` in `log_tick`).
 - **`#[init]` local statics** (`ep_mem`, `usb_bus`) give `'static` backing storage for the USB allocator — the `usb_bus: Option<...> = None` + `.replace()` dance exists because the `SerialPort`/`UsbDevice` borrow from a bus that must outlive `init`.
-- **Tasks**: `usb_irq` is hardware-bound (`binds = OTG_FS`) — it pumps `usb_dev.poll` and reads the CDC RX, where a `b'r'` byte triggers the reboot-to-DFU. `log_tick` and `imu_sample` are `async` software tasks that loop with `Mono::delay(...).await`; `log_tick` cycles the LEDs and emits the tick line, `imu_sample` reads the IMU at 10 Hz. Both share `serial`. The `dispatchers = [FDCAN1_IT0]` list donates an unused interrupt vector for RTIC to run software tasks (one dispatcher is enough while they all sit at the same priority) — add more dispatchers if you add more software-task priority levels.
+- **Tasks**: `usb_irq` (`binds = OTG_FS`) pumps `usb_dev.poll` and reads the CDC RX, where a `b'r'` byte triggers reboot-to-DFU. **`imu_drdy` (`binds = EXTI2`, `priority = 2`)** is the gyro-synchronous control loop — it fires on the IMU data-ready interrupt, reads a sample, acks it, and hands every Nth to `imu_log`. `log_tick`, `baro_sample`, and `imu_log` are `async` software tasks at the default priority (1); the high-priority `imu_drdy` never touches `serial`, so the fast loop is never blocked by USB. The `dispatchers = [FDCAN1_IT0]` list donates one interrupt vector for the priority-1 software tasks (enough while they share a priority) — add more for new priority levels.
 - Timebase is SysTick via `systick_monotonic!(Mono, 1_000)` (1 kHz tick), started in `init` with the 400 MHz core clock.
 
 ## Status LEDs
@@ -64,16 +73,27 @@ Red `PE3` / green `PE4` / blue `PE5` (GPIOE), stored as an erased-pin array in `
 
 ## Sensors — IIM-42653 IMU (`src/imu.rs`)
 
-First sensor brought up. Polled register-level driver, no external crate. Things that bite:
+First sensor brought up. Register-level driver, no external crate; interrupt-driven (see the control-loop subsection below). Things that bite:
 
 - **SPI1 needs `pll1_q_ck` enabled in the rcc chain** (`.sys_ck(400.MHz()).pll1_q_ck(80.MHz())`). PLL1_Q is SPI1's kernel clock and the HAL `.expect()`s it when building the SPI — without it `init` **panics** (which looks exactly like a hung boot: no CDC). Independent of the HSI48 USB path.
 - Pins: SCK `PA5` / MISO `PG9` / MOSI `PB5`, all **AF5** (`into_alternate::<5>()`); soft CS `PI9` driven as GPIO (active-low). **MODE_3** (CPOL=1, CPHA=1), ~8 MHz (24 MHz max). Reads use `reg | 0x80`.
 - **WHO_AM_I (`0x75`) = `0x56`** for the IIM-42653 — *not* the ICM-42688's `0x47`. `EXPECTED_WHO_AM_I` in `imu.rs`.
 - **PWR_MGMT0 (`0x4E`) = `0x0F`**: GYRO_MODE bits[3:2] + ACCEL_MODE bits[1:0], both `0b11` = Low-Noise.
 - **The IIM-42653 is the wide-range part (±32g / ±4000 dps), so its FS_SEL table is shifted up one step vs the ICM-42688**: `FS_SEL=000` = max range here. We select `FS_SEL=001` → ±16g / ±2000 dps, giving the standard 2048 LSB/g and 16.384 LSB/dps. Scaling constants depend on the selected range — change the range, change the constants.
-- Data is big-endian; burst-read `0x1D..=0x2A` (TEMP, ACCEL XYZ, GYRO XYZ) in one transaction. Soft-reset (DEVICE_CONFIG `0x11` = `0x01`) on startup gives a known state across our frequent reboots; wait ~2 ms after, then ~50 ms after `configure()` for the gyro to start.
-- DRDY (`PF2`, EXTI) is **not** used — `imu_sample` just polls at 10 Hz. Wiring it up is a future step.
+- Data is big-endian; burst-read `0x1D..=0x2A` (TEMP, ACCEL XYZ, GYRO XYZ) in one transaction. Soft-reset (DEVICE_CONFIG `0x11` = `0x01`) on startup gives a known state across our frequent reboots; wait ~2 ms after (a `cortex_m::asm::delay` busy-wait in `init`), then ~50 ms for the gyro to start (the DRDY just won't fire until it has).
 - Sanity check on hardware: accel vector magnitude ≈ 1 g at rest, gyro ≈ 0 dps.
+
+### Control-loop data path (DRDY interrupt) — the part that bit hardest
+
+The IMU drives a gyro-synchronous loop off its data-ready interrupt (INT1 → `PF2` → EXTI line 2 → RTIC `binds = EXTI2`). `configure_control_mode(odr)` (bank 0) sets FS+ODR, the UI filter bandwidth (`GYRO_ACCEL_CONFIG0` ≈ ODR/4; the AAF stays at its enabled default), routes UI-DRDY to INT1, then powers on. Verified register values (against PX4 `InvenSense_ICM42688P_registers.hpp`):
+
+- **INT_SOURCE0 (`0x65`) = `0x08`** routes UI data-ready to INT1 (bit3). **INT_CONFIG1 (`0x64`) = `0x00`** clears the default `INT_ASYNC_RESET` (bit4) — datasheet-mandated.
+- **INT_CONFIG (`0x14`) = `0x07` — LATCHED, push-pull, active-high.** This is the hard-won bit: pulsed mode (`0x03`) ran clean ~1 kHz *most* of the time but intermittently glitched into multi-second **interrupt storms** (the brief edges rang/coupled, and once edges outpaced the ~37 µs ISR it self-sustained at ISR rate ≈ 27 kHz, starving the logger). **Latched** mode holds INT1 until `INT_STATUS` (`0x2D`) is read, giving exactly one clean edge per sample. So the `imu_drdy` ISR **must** read INT_STATUS each time (`imu.clear_interrupt()`) or INT1 stays asserted and no further edge fires.
+- **REG_BANK_SEL bank 1/2 = `0x01`/`0x02`** (not `0x10`/`0x20` — a common mis-statement). We don't bank-switch yet (AAF left at default).
+- EXTI on the STM32 side: `ExtiPin` trait (`make_interrupt_source`/`trigger_on_edge(Rising)`/`enable_interrupt`/`clear_interrupt_pending_bit`); `dp.SYSCFG`/`dp.EXTI` stay owned after `freeze()`. PF2 is `into_floating_input().erase()` → `ErasedPin<Input>`.
+- **Rates live in [`src/config.rs`](src/config.rs)**: IMU ODR (= the gyro-sync loop rate; native 200/500/1000 Hz) + log throttle; baro ODR/OSR/sample/log. Controls sizing — quad/VTOL rate loop ≥400 Hz, gyro ≥1 kHz anti-aliased; baro ~25 Hz. Logging is decoupled (every Nth sample → `imu_log`) so the loop rate isn't capped by USB.
+- Verify on hardware: log the DRDY counter `n` — every logged line should advance by exactly `IMU_LOG_DIV` (no big jumps = no storms); net Δn/sec ≈ ODR.
+- Known minor: a brief interrupt burst can occur at startup before the gyro stabilizes (EXTI is enabled in `init` before the ~50 ms gyro start). Steady state is clean; gating the EXTI enable on gyro-ready is a future hardening step.
 
 ## Sensors — BMP388/BMP390 barometer (`src/baro.rs`)
 

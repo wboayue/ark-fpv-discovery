@@ -20,14 +20,18 @@ Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 The transport, dev loop, and the first two sensors are up.
 
 - Enumerates as a USB CDC serial device; readings stream out over it.
-- **IIM-42653 IMU on SPI1** (`src/imu.rs`): brought up over SPI1 (SCK `PA5` / MISO `PG9` /
-  MOSI `PB5`, soft CS `PI9`, MODE_3), WHO_AM_I-verified (`0x56`), gyro+accel in Low-Noise mode at
-  ±16g / ±2000 dps, 1 kHz. Streams scaled accel (g) / gyro (dps) / temp (°C) at 10 Hz. Polled;
-  the DRDY interrupt (`PF2`) is not used yet.
-- **BMP388/BMP390 barometer on I2C2** (`src/baro.rs`): brought up over I2C2 (SCL `PF1` / SDA `PF0`,
-  AF4 open-drain) at address `0x76`, CHIP_ID-checked (`0x50`/`0x60`), normal-mode sampling at
-  pressure ×8 / temp ×1. Reads the factory NVM calibration and applies the Bosch float
-  compensation; streams pressure (hPa) / temperature (°C) at ~2 Hz. Polled.
+- **IIM-42653 IMU on SPI1** (`src/imu.rs`): SPI1 (SCK `PA5` / MISO `PG9` / MOSI `PB5`, soft CS
+  `PI9`, MODE_3), WHO_AM_I `0x56`, ±16g / ±2000 dps, anti-alias + UI filtering. Driven by its
+  **hardware data-ready interrupt** (INT1 → `PF2` → EXTI) for a **gyro-synchronous control loop**
+  at the configured ODR (default **1 kHz**) — low-jitter, deterministic. Serial logging is
+  decoupled (every Nth sample) so USB never gates the loop.
+- **BMP388/BMP390 barometer on I2C2** (`src/baro.rs`): I2C2 (SCL `PF1` / SDA `PF0`, AF4 open-drain)
+  at `0x76`, CHIP_ID-checked (`0x50`/`0x60`), normal-mode, factory NVM calibration + Bosch float
+  compensation. Polled at 25 Hz (low-bandwidth — it can't and needn't match the IMU rate).
+- **Rates are configurable in [`src/config.rs`](src/config.rs)** — IMU ODR / log rate, baro ODR /
+  oversampling / sample rate / log rate. Sized for quad/VTOL control: the rate loop wants ≥400 Hz
+  (gyro sampled ≥1 kHz, anti-aliased), the baro only ~25 Hz. The control *law* (PID/mixer/motors)
+  is not implemented yet — this provides the timely data path it will run on.
 - Streams a `tick` counter line once per second and cycles the status LEDs red → green → blue
   (one per tick) as a heartbeat.
 - Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing.
@@ -101,16 +105,19 @@ See [`CLAUDE.md`](CLAUDE.md) for the hard-won details (USB clock path, reboot-to
 
 ## References
 
-Datasheets and reference drivers the sensor code is built from:
+Datasheets and reference drivers the sensor code is built from. Local PDF copies live in
+[`docs/datasheets/`](docs/datasheets/).
 
-- **Barometer (BMP388/BMP390)** — Bosch
-  [BMP388 datasheet](https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp388-ds001.pdf)
-  and [BMP390 datasheet](https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp390-ds002.pdf)
-  (register map, CHIP_ID, PWR_CTRL/OSR bit fields), and the Bosch
+- **Barometer (BMP388/BMP390)** — Bosch datasheets
+  [`docs/datasheets/bmp388-ds001.pdf`](docs/datasheets/bmp388-ds001.pdf) and
+  [`docs/datasheets/bmp390-ds002.pdf`](docs/datasheets/bmp390-ds002.pdf) (register map, CHIP_ID,
+  PWR_CTRL/OSR bit fields, ODR/OSR timing), and the Bosch
   [BMP3_SensorAPI](https://github.com/boschsensortec/BMP3_SensorAPI) — source of the NVM
   calibration scaling and float compensation in `src/baro.rs`.
 - **IMU (IIM-42653)** — TDK
-  [IIM-42653 datasheet](https://invensense.tdk.com/products/smartindustrial/iim-42653/)
-  and Betaflight
+  [IIM-42653 product page](https://invensense.tdk.com/products/smartindustrial/iim-42653/) (the
+  datasheet PDF is gated, so it isn't vendored), the register-identical PX4
+  [`InvenSense_ICM42688P_registers.hpp`](https://github.com/PX4/PX4-Autopilot/blob/main/src/drivers/imu/invensense/icm42688p/InvenSense_ICM42688P_registers.hpp)
+  (source of the verified INT/ODR/filter register values), and Betaflight
   [`accgyro_mpu.h`](https://github.com/betaflight/betaflight/blob/master/src/main/drivers/accgyro/accgyro_mpu.h)
-  — source of the WHO_AM_I value (`0x56`) used in `src/imu.rs`.
+  (WHO_AM_I `0x56`).
