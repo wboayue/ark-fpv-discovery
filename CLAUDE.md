@@ -20,6 +20,11 @@ Keep the code clean as it grows:
 - **Composable** — prefer small functions with clear inputs/outputs that combine, over large monolithic ones. Drivers expose narrow methods (`read_reg`, `configure`, `sample`) the tasks compose.
 - **Single responsibility (SRP)** — each module/struct/function does one thing. Keep sensor logic in its `src/<sensor>.rs` driver; keep RTIC tasks thin (orchestrate, don't embed driver internals).
 
+Concrete examples of these in the tree (reuse them; don't re-inline their patterns):
+- **[`src/i2c_regs.rs`](src/i2c_regs.rs)** — generic `I2cRegs<I2C>` (bus + 7-bit address) with `read_reg`/`read_regs`/`write_reg`. `baro` and `mag` each *compose* one instead of duplicating identical I2C access code. New I2C sensors should too. (The SPI `imu` has its own access helpers — different bus, CS toggling — and stays standalone.)
+- **`log_fmt(serial, format_args!(…))`** in `main.rs` — the one place that formats a line into a stack buffer and writes it to USB serial. It owns the single buffer size (`LOG_LINE_CAP`), so call sites carry no magic number. Use it (with `format_args!`) for all serial logging; don't hand-roll `String::new()`/`write!`/`write_serial`. Prefer this plain function over a wrapper macro — a sugar-only macro isn't worth the indirection.
+- **Driver `bring_up(…)`** (`Baro::bring_up`, `Mag::bring_up`) — own the device's reset/settle/retry *protocol* (timing, retry counts, what "ready/latched" means), taking an injected async delay closure (`|ms| Mono::delay(ms.millis())`) so the RTIC monotonic stays in `main` while the chip quirks live in the driver. This is how tasks stay thin.
+
 ## Always document sources
 
 This is a hardware-bring-up project: nearly every magic number is a register address, bit field, or coefficient from a datasheet or reference driver — and they are easy to get subtly wrong (we've been bitten by hallucinated/transposed values more than once). So **always cite where a value came from**:
@@ -109,7 +114,7 @@ The IMU drives a gyro-synchronous loop off its data-ready interrupt (INT1 → `P
 
 ## Sensors — BMP388/BMP390 barometer (`src/baro.rs`)
 
-Second sensor. Inline I2C2 driver, no external crate. Things that bite:
+Second sensor. Register-level I2C2 driver, no external crate; composes the shared [`I2cRegs`](src/i2c_regs.rs) for register access. `Baro::bring_up` owns reset → settle → load calibration → configure → wait (the task just supplies an async delay). Things that bite:
 
 - **I2C2 has NO kernel-clock trap** (unlike SPI1's PLL1_Q): I2C123 runs off `pclk1` (APB1), always live after `freeze()`. No rcc change needed.
 - Pins SCL `PF1` / SDA `PF0` must be **AF4 open-drain** — use `into_alternate_open_drain::<4>()`, **not** `into_alternate::<4>()` (push-pull won't satisfy the `Pins<I2C2>` bound; it's a compile error, so at least it fails loud).
@@ -121,17 +126,17 @@ Second sensor. Inline I2C2 driver, no external crate. Things that bite:
 
 ## Sensors — IIS2MDC/LIS2MDL magnetometer (`src/mag.rs`)
 
-Third sensor. Inline I2C4 driver, no external crate. IIS2MDC (ArduPilot naming) and LIS2MDL (Betaflight) are the same ST 3-axis magnetometer at `0x1E` with an identical register map. Things to know:
+Third sensor. Register-level I2C4 driver, no external crate; composes the shared [`I2cRegs`](src/i2c_regs.rs) for register access. IIS2MDC (ArduPilot naming) and LIS2MDL (Betaflight) are the same ST 3-axis magnetometer at `0x1E` with an identical register map. Things to know:
 
 - **I2C4 has NO kernel-clock trap either** (like I2C2): it runs off `pclk4` (APB4, D3 domain), always live after `freeze()`. The HAL exposes it the same way — `dp.I2C4.i2c(..., ccdr.peripheral.I2C4, ...)`.
 - Pins SCL `PF14` / SDA `PF15`, **AF4 open-drain** (`into_alternate_open_drain::<4>()`, same bound trap as the baro). Both are on GPIOF, already split for the IMU DRDY / baro.
 - Address `0x1E`. **WHO_AM_I (`0x4F`) = `0x40`** (ST `LIS2MDL_ID`).
 - **CFG_REG_A (`0x60`)** holds COMP_TEMP_EN[7], REBOOT[6], SOFT_RST[5], LP[4], ODR[3:2], MD[1:0]. Continuous mode is MD=`00`; the write value (50 Hz) is `COMP_TEMP_EN | ODR | MD_CONTINUOUS` = **`0x88`**. Soft reset = SOFT_RST bit5 alone (`0x20`); it self-clears, so we **poll** `reset_complete()` (CFG_A bit5 == 0) before configuring — a fixed delay isn't enough.
 - **CFG_REG_B (`0x61`) = `0x02`**: OFF_CANC (bit1) only — offset cancellation every ODR, matching the ST example (we dropped the LPF bit to stay verbatim with it). **CFG_REG_C (`0x62`) = `0x10`**: BDU (bit4) so the output regs stay coherent across a multi-byte read.
-- **The hard-won bit — the first continuous-mode write after a reset does NOT latch.** You write `0x88` to CFG_A and read back **`0x8b`**: COMP_TEMP_EN and ODR stick, but the MD bits revert to `11` (idle). The chip then sits idle — it does exactly one conversion (so the field looks like a plausible-but-frozen vector) and **temperature reads exactly `25.0 °C` (raw 0)**, the dead giveaway. A *second* CFG_A write makes continuous stick (verified: `cfgA` then holds `0x88`, `STATUS` `0x0f`, temp real). So `configure()` asserts continuous via `start_continuous()`, and the bring-up loop in `main` **re-asserts + verifies with `is_continuous()`** (up to 10×) until it latches. Same "plausible but frozen" failure class as the baro's PWR_CTRL sleep bug — if mag data is believable but static and temp is pinned at 25.0, suspect the mode bits.
+- **The hard-won bit — the first continuous-mode write after a reset does NOT latch.** You write `0x88` to CFG_A and read back **`0x8b`**: COMP_TEMP_EN and ODR stick, but the MD bits revert to `11` (idle). The chip then sits idle — it does exactly one conversion (so the field looks like a plausible-but-frozen vector) and **temperature reads exactly `25.0 °C` (raw 0)**, the dead giveaway. A *second* CFG_A write makes continuous stick (verified: `cfgA` then holds `0x88`, `STATUS` `0x0f`, temp real). So `configure()` asserts continuous via `start_continuous()`, and **`Mag::bring_up`** (which the `mag_sample` task calls) **re-asserts + verifies with `is_continuous()`** (up to 10×) until it latches. Same "plausible but frozen" failure class as the baro's PWR_CTRL sleep bug — if mag data is believable but static and temp is pinned at 25.0, suspect the mode bits.
 - Data: 6 bytes from OUTX_L (`0x68`), **little-endian** two's complement, X/Y/Z; temperature 2 bytes from `0x6E`. Scaling (ST `lis2mdl_reg.c`): **1.5 mgauss/LSB** — reported in **µT** as `raw * 0.15` (1 gauss = 100 µT); temp = `raw/8 + 25 °C`.
 - **Rates in [`src/config.rs`](src/config.rs)**: `MAG_ODR` (native 10/20/50/100 Hz) + sample/log throttle. Polled like the baro (50 Hz), decoupled from logging. `data_ready()` (STATUS_REG `0x67` Zyxda bit3) is available but unused — we poll at the ODR with BDU.
-- Sanity check on hardware (verified): field magnitude ≈ 25–65 µT (Earth's field; ~46 µT observed); a magnet or motor nearby swings it hard. Temp tracks the die (~38 °C observed), biased high near the H7 like the baro.
+- Sanity check on hardware (verified): field magnitude ≈ 25–65 µT (Earth's field; ~46 µT observed in a clean spot); a magnet or motor nearby swings it hard. Temp tracks the die (~31–38 °C observed), biased high near the H7 like the baro. **Magnitude is very sensitive to ambient hard-iron — on a metal/cluttered bench it reads 2–3× Earth's field (≈130 µT seen, steady X+Z bias, Y≈0) with no driver fault.** So when validating the mag, the *liveness* checks (data changing on all axes, temp real and ≠ exactly 25.0 °C) are the real "it works" signal; an out-of-range *magnitude* alone usually just means move the board away from metal and recheck.
 
 ## Reboot to DFU (`r` command)
 
