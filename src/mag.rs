@@ -172,7 +172,7 @@ impl Mag {
 
     /// True once CFG_REG_A reports continuous mode (MD bits == 0) — i.e. conversions are running.
     pub fn is_continuous(&mut self) -> bool {
-        self.read_cfg().0 & 0b11 == MD_CONTINUOUS
+        self.regs.read_reg(REG_CFG_A) & 0b11 == MD_CONTINUOUS
     }
 
     /// True once a fresh X/Y/Z set is available (STATUS_REG Zyxda).
