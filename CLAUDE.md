@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, runs a **gyro-synchronous control loop off the IIM-42653 IMU's data-ready interrupt** (`src/imu.rs`, SPI1, default 1 kHz) and polls the **BMP388/BMP390 barometer** (`src/baro.rs`, I2C2, 25 Hz), streams their readings (logging throttled, decoupled from the loop), and emits a `tick` counter line once per second. Sensor/loop rates are configured in `src/config.rs`.
+`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, runs a **gyro-synchronous control loop off the IIM-42653 IMU's data-ready interrupt** (`src/imu.rs`, SPI1, default 1 kHz), polls the **BMP388/BMP390 barometer** (`src/baro.rs`, I2C2, 25 Hz) and the **IIS2MDC/LIS2MDL magnetometer** (`src/mag.rs`, I2C4, 50 Hz), streams their readings (logging throttled, decoupled from the loop), and emits a `tick` counter line once per second. Sensor/loop rates are configured in `src/config.rs`.
 
 Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller. The `stm32h743v` HAL feature and the `memory.x` layout below are chosen to match its MCU. Full pin map (sensors, LEDs, UARTs, motor outputs, ADC) is in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
@@ -68,7 +68,7 @@ Everything lives in one `#[rtic::app]` module — there is no `main()`. Key conv
 - **`#[shared]` resources** (`usb_dev`, `serial`) are accessed only inside `.lock(|r| ...)` closures; RTIC enforces this for data-race freedom across priorities.
 - **`#[local]` resources** belong to exactly one task (e.g. `counter` in `log_tick`).
 - **`#[init]` local statics** (`ep_mem`, `usb_bus`) give `'static` backing storage for the USB allocator — the `usb_bus: Option<...> = None` + `.replace()` dance exists because the `SerialPort`/`UsbDevice` borrow from a bus that must outlive `init`.
-- **Tasks**: `usb_irq` (`binds = OTG_FS`) pumps `usb_dev.poll` and reads the CDC RX, where a `b'r'` byte triggers reboot-to-DFU. **`imu_drdy` (`binds = EXTI2`, `priority = 2`)** is the gyro-synchronous control loop — it fires on the IMU data-ready interrupt, reads a sample, acks it, and hands every Nth to `imu_log`. `log_tick`, `baro_sample`, and `imu_log` are `async` software tasks at the default priority (1); the high-priority `imu_drdy` never touches `serial`, so the fast loop is never blocked by USB. The `dispatchers = [FDCAN1_IT0]` list donates one interrupt vector for the priority-1 software tasks (enough while they share a priority) — add more for new priority levels.
+- **Tasks**: `usb_irq` (`binds = OTG_FS`) pumps `usb_dev.poll` and reads the CDC RX, where a `b'r'` byte triggers reboot-to-DFU. **`imu_drdy` (`binds = EXTI2`, `priority = 2`)** is the gyro-synchronous control loop — it fires on the IMU data-ready interrupt, reads a sample, acks it, and hands every Nth to `imu_log`. `log_tick`, `baro_sample`, `mag_sample`, and `imu_log` are `async` software tasks at the default priority (1); the high-priority `imu_drdy` never touches `serial`, so the fast loop is never blocked by USB. The `dispatchers = [FDCAN1_IT0]` list donates one interrupt vector for the priority-1 software tasks (enough while they share a priority) — add more for new priority levels.
 - Timebase is SysTick via `systick_monotonic!(Mono, 1_000)` (1 kHz tick), started in `init` with the 400 MHz core clock.
 
 ## Status LEDs
@@ -111,6 +111,20 @@ Second sensor. Inline I2C2 driver, no external crate. Things that bite:
 - Data: 6 bytes from `0x04`, little-endian (XLSB/LSB/MSB), pressure then temperature.
 - Sanity check on hardware: pressure ≈ 950–1030 hPa; temperature reads the sensor's *local* board temp (runs well above ambient near the H7 — ~50 °C observed), and breathing on the board swings it noticeably (toward breath temp).
 
+## Sensors — IIS2MDC/LIS2MDL magnetometer (`src/mag.rs`)
+
+Third sensor. Inline I2C4 driver, no external crate. IIS2MDC (ArduPilot naming) and LIS2MDL (Betaflight) are the same ST 3-axis magnetometer at `0x1E` with an identical register map. Things to know:
+
+- **I2C4 has NO kernel-clock trap either** (like I2C2): it runs off `pclk4` (APB4, D3 domain), always live after `freeze()`. The HAL exposes it the same way — `dp.I2C4.i2c(..., ccdr.peripheral.I2C4, ...)`.
+- Pins SCL `PF14` / SDA `PF15`, **AF4 open-drain** (`into_alternate_open_drain::<4>()`, same bound trap as the baro). Both are on GPIOF, already split for the IMU DRDY / baro.
+- Address `0x1E`. **WHO_AM_I (`0x4F`) = `0x40`** (ST `LIS2MDL_ID`).
+- **CFG_REG_A (`0x60`)** holds COMP_TEMP_EN[7], REBOOT[6], SOFT_RST[5], LP[4], ODR[3:2], MD[1:0]. Continuous mode is MD=`00`; the write value (50 Hz) is `COMP_TEMP_EN | ODR | MD_CONTINUOUS` = **`0x88`**. Soft reset = SOFT_RST bit5 alone (`0x20`); it self-clears, so we **poll** `reset_complete()` (CFG_A bit5 == 0) before configuring — a fixed delay isn't enough.
+- **CFG_REG_B (`0x61`) = `0x02`**: OFF_CANC (bit1) only — offset cancellation every ODR, matching the ST example (we dropped the LPF bit to stay verbatim with it). **CFG_REG_C (`0x62`) = `0x10`**: BDU (bit4) so the output regs stay coherent across a multi-byte read.
+- **The hard-won bit — the first continuous-mode write after a reset does NOT latch.** You write `0x88` to CFG_A and read back **`0x8b`**: COMP_TEMP_EN and ODR stick, but the MD bits revert to `11` (idle). The chip then sits idle — it does exactly one conversion (so the field looks like a plausible-but-frozen vector) and **temperature reads exactly `25.0 °C` (raw 0)**, the dead giveaway. A *second* CFG_A write makes continuous stick (verified: `cfgA` then holds `0x88`, `STATUS` `0x0f`, temp real). So `configure()` asserts continuous via `start_continuous()`, and the bring-up loop in `main` **re-asserts + verifies with `is_continuous()`** (up to 10×) until it latches. Same "plausible but frozen" failure class as the baro's PWR_CTRL sleep bug — if mag data is believable but static and temp is pinned at 25.0, suspect the mode bits.
+- Data: 6 bytes from OUTX_L (`0x68`), **little-endian** two's complement, X/Y/Z; temperature 2 bytes from `0x6E`. Scaling (ST `lis2mdl_reg.c`): **1.5 mgauss/LSB** — reported in **µT** as `raw * 0.15` (1 gauss = 100 µT); temp = `raw/8 + 25 °C`.
+- **Rates in [`src/config.rs`](src/config.rs)**: `MAG_ODR` (native 10/20/50/100 Hz) + sample/log throttle. Polled like the baro (50 Hz), decoupled from logging. `data_ready()` (STATUS_REG `0x67` Zyxda bit3) is available but unused — we poll at the ODR with BDU.
+- Sanity check on hardware (verified): field magnitude ≈ 25–65 µT (Earth's field; ~46 µT observed); a magnet or motor nearby swings it hard. Temp tracks the die (~38 °C observed), biased high near the H7 like the baro.
+
 ## Reboot to DFU (`r` command)
 
 Sending `r` over the serial link reboots into the ROM bootloader so the board can be reflashed without touching BOOT0/RESET. Mechanism:
@@ -119,6 +133,10 @@ Sending `r` over the serial link reboots into the ROM bootloader so the board ca
 2. After reset, `maybe_enter_bootloader()` runs as the **first line of `init`** — before any clock/peripheral setup, while clocks are at reset defaults — and if the magic is set, clears it and `cortex_m::asm::bootload(0x1FF0_9800)` into the H743 system-memory bootloader.
 
 **Do NOT move this jump into `#[cortex_m_rt::pre_init]`.** That ran before RAM init, was unsound, and bricked the boot (no CDC, no LED, not even DFU — only BOOT0 recovered it). Checking the flag at the top of `init` is the working approach.
+
+## Diagnostic mode (`d` command)
+
+Sending `d` over the serial link toggles verbose sensor diagnostics at runtime (and replies `diag on`/`diag off`). It flips a lock-free `static DIAG: AtomicBool` (read with `diag_enabled()`, no RTIC resource lock) which `usb_irq` toggles alongside the `r` handler. Currently `mag_sample` honors it: off → concise `mag field[uT]=… temp=…C`; on → `mag[diag] id=… cfgA=… B=… C=… field=… temp=… status=…` register dump (read-only — no side effects). Extensible to other tasks the same way. This is how the IIS2MDC continuous-mode-latch bug above was diagnosed on hardware without reflashing per probe.
 
 ## Naming note
 

@@ -17,7 +17,7 @@ Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
 ## Current state
 
-The transport, dev loop, and the first two sensors are up.
+The transport, dev loop, and all three onboard sensors are up.
 
 - Enumerates as a USB CDC serial device; readings stream out over it.
 - **IIM-42653 IMU on SPI1** (`src/imu.rs`): SPI1 (SCK `PA5` / MISO `PG9` / MOSI `PB5`, soft CS
@@ -28,14 +28,21 @@ The transport, dev loop, and the first two sensors are up.
 - **BMP388/BMP390 barometer on I2C2** (`src/baro.rs`): I2C2 (SCL `PF1` / SDA `PF0`, AF4 open-drain)
   at `0x76`, CHIP_ID-checked (`0x50`/`0x60`), normal-mode, factory NVM calibration + Bosch float
   compensation. Polled at 25 Hz (low-bandwidth — it can't and needn't match the IMU rate).
+- **IIS2MDC/LIS2MDL magnetometer on I2C4** (`src/mag.rs`): I2C4 (SCL `PF14` / SDA `PF15`, AF4
+  open-drain) at `0x1E`, WHO_AM_I-checked (`0x40`), continuous-conversion mode with on-chip
+  temperature compensation and offset cancellation. Reports the field in µT (1.5 mgauss/LSB) plus
+  die temperature. Polled at 50 Hz (low-bandwidth, like the baro). The first continuous-mode write
+  after reset doesn't latch, so bring-up re-asserts and verifies (see `CLAUDE.md`).
 - **Rates are configurable in [`src/config.rs`](src/config.rs)** — IMU ODR / log rate, baro ODR /
-  oversampling / sample rate / log rate. Sized for quad/VTOL control: the rate loop wants ≥400 Hz
+  oversampling / sample rate / log rate, mag ODR / sample rate / log rate. Sized for quad/VTOL
+  control: the rate loop wants ≥400 Hz
   (gyro sampled ≥1 kHz, anti-aliased), the baro only ~25 Hz. The control *law* (PID/mixer/motors)
   is not implemented yet — this provides the timely data path it will run on.
 - Streams a `tick` counter line once per second and cycles the status LEDs red → green → blue
   (one per tick) as a heartbeat.
-- Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing.
-- **Roadmap:** magnetometer (IIS2MDC/LIS2MDL on I2C4), then sensor fusion.
+- Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing; `d`
+  toggles verbose per-sensor diagnostics (register dumps) at runtime.
+- **Roadmap:** sensor fusion across the IMU, baro, and magnetometer.
 
 ## Hardware
 
@@ -95,6 +102,7 @@ red → green → blue in sync.
 | `src/main.rs`            | The `#[rtic::app]` module — init, tasks, peripheral wiring |
 | `src/imu.rs`             | IIM-42653 IMU driver (SPI1)                       |
 | `src/baro.rs`            | BMP388/BMP390 barometer driver (I2C2)             |
+| `src/mag.rs`             | IIS2MDC/LIS2MDL magnetometer driver (I2C4)        |
 | `memory.x`               | Linker regions: FLASH @ `0x08000000`, RAM @ `0x20000000` |
 | `.cargo/config.toml`     | Target + linker args                             |
 | `docs/ark-fpv-board.md`  | ARK FPV pin map                                  |
@@ -121,3 +129,10 @@ Datasheets and reference drivers the sensor code is built from. Local PDF copies
   (source of the verified INT/ODR/filter register values), and Betaflight
   [`accgyro_mpu.h`](https://github.com/betaflight/betaflight/blob/master/src/main/drivers/accgyro/accgyro_mpu.h)
   (WHO_AM_I `0x56`).
+- **Magnetometer (IIS2MDC/LIS2MDL)** — ST
+  [LIS2MDL datasheet](https://www.st.com/resource/en/datasheet/lis2mdl.pdf) (the PDF is gated, so
+  it isn't vendored) and ST's official driver
+  [`lis2mdl-pid`](https://github.com/STMicroelectronics/lis2mdl-pid)
+  (`lis2mdl_reg.h`/`lis2mdl_reg.c`) — source of the register map, CFG bit fields, WHO_AM_I `0x40`,
+  and the LSB scaling (1.5 mgauss/LSB; temp `lsb/8 + 25 °C`) in `src/mag.rs`. IIS2MDC (ArduPilot)
+  and LIS2MDL (Betaflight) are the same part at `0x1E`.

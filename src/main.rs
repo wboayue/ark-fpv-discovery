@@ -6,11 +6,13 @@ use panic_halt as _;
 mod baro;
 mod config;
 mod imu;
+mod mag;
 
 use heapless::String;
 use stm32h7xx_hal as hal;
 
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use hal::{
     gpio::{Edge, ErasedPin, ExtiPin, Input, Output, PinState, PushPull},
@@ -34,6 +36,21 @@ systick_monotonic!(Mono, 1_000);
 // --- Reboot-to-DFU support ----------------------------------------------------
 // Sending 'r' over the USB serial link reboots the board into the STM32 ROM
 // bootloader, so it can be reflashed with dfu-util without touching BOOT0/RESET.
+
+// --- Runtime diagnostic mode --------------------------------------------------
+// Toggled by the 'd' byte over USB serial (alongside 'r' for reboot-to-DFU). When on, sensor
+// tasks emit verbose register-level dumps instead of concise readings. Lock-free so any task can
+// read it without an RTIC resource lock.
+static DIAG: AtomicBool = AtomicBool::new(false);
+
+fn diag_enabled() -> bool {
+    DIAG.load(Ordering::Relaxed)
+}
+
+/// Flip the diagnostic flag; returns the new state.
+fn toggle_diag() -> bool {
+    !DIAG.fetch_xor(true, Ordering::Relaxed)
+}
 
 /// Written to `BOOT_FLAG` to request a ROM-bootloader jump on the next boot.
 const BOOTLOADER_MAGIC: u32 = 0xB007_0DF1;
@@ -74,6 +91,7 @@ mod app {
     use super::*;
     use crate::baro::{Baro, CHIP_ID_BMP388, CHIP_ID_BMP390};
     use crate::imu::{Imu, ImuSample};
+    use crate::mag::Mag;
 
     /// Lock the shared USB serial port and write `msg`. Generic over the RTIC resource
     /// proxy so every task shares one code path. Best-effort: write errors are dropped.
@@ -103,6 +121,7 @@ mod app {
         imu_drdy: ErasedPin<Input>,
         imu_id: u8,
         baro: Baro,
+        mag: Mag,
     }
 
     #[init(local = [
@@ -189,6 +208,19 @@ mod app {
         );
         let baro = Baro::new(i2c);
 
+        // IIS2MDC/LIS2MDL magnetometer on I2C4: SCL=PF14, SDA=PF15 (AF4, open-drain). Like I2C2,
+        // no kernel-clock setup needed — I2C4 runs off pclk4 (APB4/D3), always live after freeze().
+        let i2c4 = dp.I2C4.i2c(
+            (
+                gpiof.pf14.into_alternate_open_drain::<4>(),
+                gpiof.pf15.into_alternate_open_drain::<4>(),
+            ),
+            400.kHz(),
+            ccdr.peripheral.I2C4,
+            &ccdr.clocks,
+        );
+        let mag = Mag::new(i2c4);
+
         // PA11 = USB DM, PA12 = USB DP
         let usb_dm = gpioa.pa11.into_alternate();
         let usb_dp = gpioa.pa12.into_alternate();
@@ -222,11 +254,12 @@ mod app {
 
         log_tick::spawn().ok();
         baro_sample::spawn().ok();
+        mag_sample::spawn().ok();
         // The IMU loop is driven by the DRDY interrupt (EXTI2), not spawned here.
 
         (
             Shared { usb_dev, serial },
-            Local { counter: 0, leds, imu, imu_drdy, imu_id, baro },
+            Local { counter: 0, leds, imu, imu_drdy, imu_id, baro, mag },
         )
     }
 
@@ -235,11 +268,16 @@ mod app {
         cx.shared.usb_dev.lock(|usb_dev| {
             cx.shared.serial.lock(|serial| {
                 if usb_dev.poll(&mut [serial]) {
-                    // 'r' reboots into the ROM bootloader for dfu-util flashing.
                     let mut buf = [0u8; 32];
                     if let Ok(n) = serial.read(&mut buf) {
+                        // 'r' reboots into the ROM bootloader for dfu-util flashing (never returns).
                         if buf[..n].contains(&b'r') {
                             reboot_to_bootloader();
+                        }
+                        // 'd' toggles verbose sensor diagnostics at runtime.
+                        if buf[..n].contains(&b'd') {
+                            let on = toggle_diag();
+                            let _ = serial.write(if on { b"diag on\r\n" } else { b"diag off\r\n" });
                         }
                     }
                 }
@@ -361,6 +399,87 @@ mod app {
                     s.pressure_hpa, s.temp_c
                 )
                 .ok();
+                write_serial(&mut cx.shared.serial, &msg);
+            }
+
+            Mono::delay(period).await;
+        }
+    }
+
+    // Bring up the IIS2MDC/LIS2MDL magnetometer (polled) and stream the field/temp. Sample and log
+    // rates come from `config` and are decoupled (sampled fast, logged every Nth), like the baro.
+    #[task(shared = [serial], local = [mag])]
+    async fn mag_sample(mut cx: mag_sample::Context) {
+        let mag = cx.local.mag;
+
+        let id = mag.who_am_i();
+        let mut msg: String<128> = String::new();
+        let ok = if id == crate::mag::EXPECTED_WHO_AM_I { "ok" } else { "MISMATCH" };
+        write!(
+            &mut msg,
+            "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}\r\n",
+            id,
+            crate::mag::EXPECTED_WHO_AM_I,
+            ok
+        )
+        .ok();
+        write_serial(&mut cx.shared.serial, &msg);
+
+        // Soft-reset, then WAIT for SOFT_RST to self-clear before configuring — otherwise the
+        // tail of the reset clobbers the MD bits and the chip stays idle (frozen data).
+        mag.soft_reset();
+        for _ in 0..10 {
+            Mono::delay(2.millis()).await;
+            if mag.reset_complete() {
+                break;
+            }
+        }
+        mag.configure(config::MAG_ODR);
+        // The first continuous-mode write after reset frequently fails to latch — the chip reverts
+        // MD to idle, leaving it idle (frozen data, temp stuck at 25 C). Re-assert until CFG_A
+        // reports continuous (observed: a second write makes it stick).
+        let mut started = false;
+        for _ in 0..10 {
+            Mono::delay(10.millis()).await;
+            if mag.is_continuous() {
+                started = true;
+                break;
+            }
+            mag.start_continuous(config::MAG_ODR);
+        }
+        if !started {
+            let mut msg: String<64> = String::new();
+            write!(&mut msg, "mag: failed to enter continuous mode\r\n").ok();
+            write_serial(&mut cx.shared.serial, &msg);
+        }
+
+        let period = (1_000 / config::MAG_SAMPLE_HZ).millis();
+        let mut n: u32 = 0;
+        loop {
+            let st = mag.status();
+            let s = mag.read();
+            n = n.wrapping_add(1);
+
+            if n % config::MAG_LOG_DIV == 0 {
+                let mut msg: String<192> = String::new();
+                if diag_enabled() {
+                    // Verbose, read-only: chip ID, the three config registers, and STATUS.
+                    let id = mag.who_am_i();
+                    let (ca, cb, cc) = mag.read_cfg();
+                    write!(
+                        &mut msg,
+                        "mag[diag] id=0x{:02x} cfgA=0x{:02x} B=0x{:02x} C=0x{:02x} field[uT]={:.1},{:.1},{:.1} temp={:.1}C status=0x{:02x}\r\n",
+                        id, ca, cb, cc, s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c, st
+                    )
+                    .ok();
+                } else {
+                    write!(
+                        &mut msg,
+                        "mag field[uT]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
+                        s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c
+                    )
+                    .ok();
+                }
                 write_serial(&mut cx.shared.serial, &msg);
             }
 
