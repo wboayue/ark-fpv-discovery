@@ -10,7 +10,11 @@
 //! `compensate_temperature`, `compensate_pressure`):
 //!   <https://github.com/boschsensortec/BMP3_SensorAPI/blob/master/bmp3.c>
 
-use stm32h7xx_hal::{self as hal, prelude::*};
+use core::future::Future;
+
+use stm32h7xx_hal as hal;
+
+use crate::i2c_regs::I2cRegs;
 
 type I2c2 = hal::i2c::I2c<hal::pac::I2C2>;
 
@@ -131,7 +135,7 @@ struct Calib {
 }
 
 pub struct Baro {
-    i2c: I2c2,
+    regs: I2cRegs<I2c2>,
     calib: Calib,
 }
 
@@ -140,23 +144,21 @@ impl Baro {
     /// [`read_calibration`](Self::read_calibration) runs.
     pub fn new(i2c: I2c2) -> Self {
         Self {
-            i2c,
+            regs: I2cRegs::new(i2c, ADDR),
             calib: Calib::default(),
         }
     }
 
     fn read_regs(&mut self, reg: u8, buf: &mut [u8]) {
-        let _ = self.i2c.write_read(ADDR, &[reg], buf);
+        self.regs.read_regs(reg, buf);
     }
 
     fn write_reg(&mut self, reg: u8, val: u8) {
-        let _ = self.i2c.write(ADDR, &[reg, val]);
+        self.regs.write_reg(reg, val);
     }
 
     pub fn chip_id(&mut self) -> u8 {
-        let mut b = [0u8; 1];
-        self.read_regs(REG_CHIP_ID, &mut b);
-        b[0]
+        self.regs.read_reg(REG_CHIP_ID)
     }
 
     /// Soft-reset to a known state. Caller must wait ~2 ms afterwards.
@@ -223,6 +225,29 @@ impl Baro {
         self.write_reg(REG_OSR, (osr_t.reg() << 3) | osr_p.reg());
         self.write_reg(REG_ODR, odr.reg());
         self.write_reg(REG_PWR_CTRL, PWR_CTRL_NORMAL);
+        Ok(())
+    }
+
+    /// Full polled bring-up: soft-reset, settle, load factory calibration, start normal-mode
+    /// sampling, then wait for the first conversion. Encapsulates the reset/settle timing so the
+    /// caller only supplies an async millisecond delay (e.g. `|ms| Mono::delay(ms.millis())`).
+    /// Returns `Err(OdrTooFast)` straight from [`configure`](Self::configure).
+    pub async fn bring_up<F, Fut>(
+        &mut self,
+        odr: BaroOdr,
+        osr_p: Oversampling,
+        osr_t: Oversampling,
+        mut delay_ms: F,
+    ) -> Result<(), ConfigError>
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.soft_reset();
+        delay_ms(5).await; // ~2 ms reset + margin
+        self.read_calibration();
+        self.configure(odr, osr_p, osr_t)?;
+        delay_ms(50).await; // let the first normal-mode conversion complete
         Ok(())
     }
 

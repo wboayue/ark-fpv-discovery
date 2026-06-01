@@ -2,6 +2,7 @@
 
 use crate::baro::{BaroOdr, Oversampling};
 use crate::imu::ImuOdr;
+use crate::mag::MagOdr;
 
 // --- IMU ---------------------------------------------------------------------
 // The IMU loop is gyro-synchronous: its data-ready interrupt fires at IMU_ODR, so IMU_ODR *is*
@@ -23,3 +24,12 @@ pub const BARO_SAMPLE_HZ: u32 = 25;
 pub const BARO_LOG_HZ: u32 = 5;
 /// Log one of every `BARO_LOG_DIV` samples (must divide evenly).
 pub const BARO_LOG_DIV: u32 = BARO_SAMPLE_HZ / BARO_LOG_HZ;
+
+// --- Magnetometer ------------------------------------------------------------
+// Low-bandwidth heading sensor; polled like the baro. ODR sets the continuous-conversion rate;
+// sample below it. Logged slower than sampled.
+pub const MAG_ODR: MagOdr = MagOdr::Hz50;
+pub const MAG_SAMPLE_HZ: u32 = 50;
+pub const MAG_LOG_HZ: u32 = 5;
+/// Log one of every `MAG_LOG_DIV` samples (must divide evenly).
+pub const MAG_LOG_DIV: u32 = MAG_SAMPLE_HZ / MAG_LOG_HZ;
