@@ -12,6 +12,14 @@ Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight control
 
 Do feature work on a new branch off `main` — never commit directly to `main`. Branch first (`git switch -c <name>`), then commit; land via PR.
 
+## Code style
+
+Keep the code clean as it grows:
+
+- **No duplication (DRY)** — factor repeated logic/constants into one shared place; don't copy-paste. The sensor drivers share register-read/write patterns — extract a helper rather than re-inlining.
+- **Composable** — prefer small functions with clear inputs/outputs that combine, over large monolithic ones. Drivers expose narrow methods (`read_reg`, `configure`, `sample`) the tasks compose.
+- **Single responsibility (SRP)** — each module/struct/function does one thing. Keep sensor logic in its `src/<sensor>.rs` driver; keep RTIC tasks thin (orchestrate, don't embed driver internals).
+
 ## Always document sources
 
 This is a hardware-bring-up project: nearly every magic number is a register address, bit field, or coefficient from a datasheet or reference driver — and they are easy to get subtly wrong (we've been bitten by hallucinated/transposed values more than once). So **always cite where a value came from**:
