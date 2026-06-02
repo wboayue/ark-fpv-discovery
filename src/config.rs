@@ -33,3 +33,39 @@ pub const MAG_SAMPLE_HZ: u32 = 50;
 pub const MAG_LOG_HZ: u32 = 5;
 /// Log one of every `MAG_LOG_DIV` samples (must divide evenly).
 pub const MAG_LOG_DIV: u32 = MAG_SAMPLE_HZ / MAG_LOG_HZ;
+
+// --- Fusion ------------------------------------------------------------------
+// Attitude (fusion-ahrs) + altitude/vertical-velocity (fusion-altitude) run in a dedicated async
+// task, decoupled from every sensor ODR. imu_drdy accumulates gyro/accel at IMU_ODR; the fusion
+// task drains the mean each tick (delta-angle downsampling → full 1 kHz gyro fidelity at a 250 Hz
+// estimator). Keep FUSION_RATE_HZ <= ~250-333 so the measured dt stays >= 3 SysTick (1 ms) ticks.
+pub const FUSION_RATE_HZ: u32 = 250;
+pub const FUSION_LOG_HZ: u32 = 10;
+/// Log one of every `FUSION_LOG_DIV` fused states (must divide evenly).
+pub const FUSION_LOG_DIV: u32 = FUSION_RATE_HZ / FUSION_LOG_HZ;
+/// Measured-dt clamp (s): guards the first iteration and any scheduling gap from corrupting the
+/// altitude velocity integration. Nominal period is 1/FUSION_RATE_HZ = 4 ms.
+pub const FUSION_DT_MIN_S: f32 = 0.001;
+pub const FUSION_DT_MAX_S: f32 = 0.050;
+
+// 9-DOF (use the mag for absolute yaw) vs 6-DOF (gyro+accel; yaw is relative and drifts). The mag
+// is hard-iron-sensitive on a cluttered bench (CLAUDE.md), so this toggle lets us validate
+// roll/pitch independently of bench yaw error.
+pub const FUSION_USE_MAG: bool = true;
+
+// AHRS tuning (fusion-ahrs `AhrsSettings`). Values follow the canonical xioTechnologies Fusion
+// example (gain 0.5; accel/mag rejection 10°; recovery after ~5 s of continuous rejection).
+pub const AHRS_GAIN: f32 = 0.5;
+pub const AHRS_GYRO_RANGE_DPS: f32 = 2000.0; // matches IMU FS_SEL=001 (±2000 dps); see src/imu.rs
+pub const AHRS_ACCEL_REJECTION: f32 = 10.0;
+pub const AHRS_MAG_REJECTION: f32 = 10.0;
+pub const AHRS_RECOVERY_TRIGGER_PERIOD: u32 = 5 * FUSION_RATE_HZ; // in samples (~5 s)
+
+// Altitude estimator gains (fusion-altitude `AltitudeSettings`) — its documented defaults.
+pub const ALT_POSITION_GAIN: f32 = 2.40;
+pub const ALT_VELOCITY_GAIN: f32 = 2.88;
+pub const ALT_BIAS_GAIN: f32 = 0.675;
+
+// Reference sea-level pressure for the barometric formula (hPa). ISA standard; altitude is
+// re-zeroed at startup via the estimator's reset(), so this only sets the absolute (MSL) offset.
+pub const P0_REFERENCE: f32 = 1013.25;

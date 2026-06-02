@@ -4,8 +4,8 @@ A discovery project for **reading and processing sensor data** from the
 [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller (STM32H743, Cortex-M7) —
 bare-metal (`#![no_std]`) Rust firmware on the [RTIC 2](https://rtic.rs) async framework.
 
-The aim is to bring up each onboard sensor in turn, stream its readings out over USB, and build
-toward fusing them. The board carries:
+The aim is to bring up each onboard sensor in turn, stream its readings out over USB, and fuse
+them into attitude and altitude estimates. The board carries:
 
 | Sensor | Part | Bus |
 | --- | --- | --- |
@@ -17,7 +17,7 @@ Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
 ## Current state
 
-The transport, dev loop, and all three onboard sensors are up.
+The transport, dev loop, all three onboard sensors, and sensor fusion are up.
 
 - Enumerates as a USB CDC serial device; readings stream out over it.
 - **IIM-42653 IMU on SPI1** (`src/imu.rs`): SPI1 (SCK `PA5` / MISO `PG9` / MOSI `PB5`, soft CS
@@ -33,6 +33,14 @@ The transport, dev loop, and all three onboard sensors are up.
   temperature compensation and offset cancellation. Reports the field in µT (1.5 mgauss/LSB) plus
   die temperature. Polled at 50 Hz (low-bandwidth, like the baro). The first continuous-mode write
   after reset doesn't latch, so bring-up re-asserts and verifies (see `CLAUDE.md`).
+- **Sensor fusion** (`src/fusion.rs`): fuses all three sensors into **attitude** (roll/pitch/yaw)
+  via [`fusion-ahrs`](https://github.com/wboayue/fusion-ahrs) and **altitude + vertical velocity**
+  via [`fusion-altitude`](https://github.com/wboayue/fusion-altitude), in a dedicated 250 Hz task.
+  `imu_drdy` accumulates gyro/accel at the full 1 kHz (pure adds in the ISR); the fusion task drains
+  the mean each tick (**delta-angle downsampling** — full gyro fidelity, estimator decoupled, heavy
+  math off the interrupt path). 9-DOF (mag for absolute yaw) or 6-DOF, toggled in `config`. Logs a
+  `fus roll=… pitch=… yaw=…deg alt=…m vz=…m/s` line and keeps the latest estimate in a shared
+  resource for a future control loop. Altitude is relative (re-zeroed at startup).
 - **Rates are configurable in [`src/config.rs`](src/config.rs)** — IMU ODR / log rate, baro ODR /
   oversampling / sample rate / log rate, mag ODR / sample rate / log rate. Sized for quad/VTOL
   control: the rate loop wants ≥400 Hz
@@ -42,7 +50,7 @@ The transport, dev loop, and all three onboard sensors are up.
   (one per tick) as a heartbeat.
 - Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing; `d`
   toggles verbose per-sensor diagnostics (register dumps) at runtime.
-- **Roadmap:** sensor fusion across the IMU, baro, and magnetometer.
+- **Roadmap:** the control law (PID/mixer/motor outputs) on top of the fused estimate.
 
 ## Hardware
 
@@ -103,6 +111,7 @@ red → green → blue in sync.
 | `src/imu.rs`             | IIM-42653 IMU driver (SPI1)                       |
 | `src/baro.rs`            | BMP388/BMP390 barometer driver (I2C2)             |
 | `src/mag.rs`             | IIS2MDC/LIS2MDL magnetometer driver (I2C4)        |
+| `src/fusion.rs`          | Sensor fusion: attitude (fusion-ahrs) + altitude (fusion-altitude) |
 | `memory.x`               | Linker regions: FLASH @ `0x08000000`, RAM @ `0x20000000` |
 | `.cargo/config.toml`     | Target + linker args                             |
 | `docs/ark-fpv-board.md`  | ARK FPV pin map                                  |
@@ -136,3 +145,9 @@ Datasheets and reference drivers the sensor code is built from. Local PDF copies
   (`lis2mdl_reg.h`/`lis2mdl_reg.c`) — source of the register map, CFG bit fields, WHO_AM_I `0x40`,
   and the LSB scaling (1.5 mgauss/LSB; temp `lsb/8 + 25 °C`) in `src/mag.rs`. IIS2MDC (ArduPilot)
   and LIS2MDL (Betaflight) are the same part at `0x1E`.
+- **Sensor fusion** — [`fusion-ahrs`](https://github.com/wboayue/fusion-ahrs) (attitude; a Rust
+  port of xioTechnologies' Fusion AHRS — gain/rejection settings follow its canonical example) and
+  [`fusion-altitude`](https://github.com/wboayue/fusion-altitude) (a 3rd-order complementary
+  observer for altitude + vertical velocity). The pressure→altitude step in `src/fusion.rs` uses the
+  ISA/NOAA hypsometric formula `44330 * (1 - (p/p0)^(1/5.255))` (constants per the Bosch BMP3
+  examples).
