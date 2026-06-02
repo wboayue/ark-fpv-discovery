@@ -104,6 +104,9 @@ pub struct Fusion {
     altitude: AltitudeEstimator,
     use_mag: bool,
     alt_seeded: bool,
+    /// Most recent baro altitude (m), held between baro samples so the altitude observer can run
+    /// every fusion tick with continuous baro correction (it's slower than the fusion rate).
+    baro_alt_m: f32,
 }
 
 impl Fusion {
@@ -128,6 +131,7 @@ impl Fusion {
             altitude: AltitudeEstimator::with_settings(alt),
             use_mag,
             alt_seeded: false,
+            baro_alt_m: 0.0,
         }
     }
 
@@ -171,7 +175,7 @@ impl Fusion {
 
         let (roll, pitch, yaw) = self.ahrs.quaternion().euler_angles(); // radians
 
-        // Altitude only advances on a fresh baro sample. Gravity-compensated, earth-frame, +up.
+        // Refresh the held baro reference when a new sample arrives; seed on the first one.
         if let Some(p_hpa) = pressure_hpa {
             let alt = pressure_to_altitude_m(p_hpa, config::P0_REFERENCE);
             if !self.alt_seeded {
@@ -181,8 +185,18 @@ impl Fusion {
                 self.altitude.reset(alt);
                 self.alt_seeded = true;
             }
+            self.baro_alt_m = alt;
+        }
+
+        // Run the altitude observer EVERY fusion tick (high-rate accel predict + continuous baro
+        // correction), once seeded. Critical: the estimator's `dt` must be the time since its
+        // previous `update` — i.e. the fusion tick interval. Updating it only on fresh baro (~25 Hz)
+        // while passing the ~4 ms tick dt advances the filter at 1/10 real-time, so velocity damps
+        // ~10× too slowly (vz rings for seconds). The baro is held between samples — that's the
+        // standard complementary-filter structure. Vertical accel is gravity-compensated, +up (NWU).
+        if self.alt_seeded {
             let vertical_accel = self.ahrs.earth_acceleration().z * GRAVITY; // g → m/s²
-            self.altitude.update(vertical_accel, alt, dt);
+            self.altitude.update(vertical_accel, self.baro_alt_m, dt);
         }
 
         FusedState {
