@@ -66,6 +66,7 @@ pub const ALT_POSITION_GAIN: f32 = 2.40;
 pub const ALT_VELOCITY_GAIN: f32 = 2.88;
 pub const ALT_BIAS_GAIN: f32 = 0.675;
 
-// Reference sea-level pressure for the barometric formula (hPa). ISA standard; altitude is
-// re-zeroed at startup via the estimator's reset(), so this only sets the absolute (MSL) offset.
+// Reference sea-level pressure for the barometric formula (hPa). ISA standard. Altitude is
+// absolute ISA height relative to this P0 (not re-zeroed at startup — the estimator is *seeded* to
+// the first baro altitude so it starts converged). Set a local QNH here for true MSL altitude.
 pub const P0_REFERENCE: f32 = 1013.25;

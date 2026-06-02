@@ -40,7 +40,8 @@ The transport, dev loop, all three onboard sensors, and sensor fusion are up.
   the mean each tick (**delta-angle downsampling** — full gyro fidelity, estimator decoupled, heavy
   math off the interrupt path). 9-DOF (mag for absolute yaw) or 6-DOF, toggled in `config`. Logs a
   `fus roll=… pitch=… yaw=…deg alt=…m vz=…m/s` line and keeps the latest estimate in a shared
-  resource for a future control loop. Altitude is relative (re-zeroed at startup).
+  resource for a future control loop. Altitude is absolute ISA height (relative to a fixed P0),
+  seeded at startup so it starts converged; vertical velocity is the meaningful relative signal.
 - **Rates are configurable in [`src/config.rs`](src/config.rs)** — IMU ODR / log rate, baro ODR /
   oversampling / sample rate / log rate, mag ODR / sample rate / log rate. Sized for quad/VTOL
   control: the rate loop wants ≥400 Hz

@@ -36,11 +36,6 @@ pub struct FusedState {
     pub vertical_velocity: f32,
 }
 
-#[inline]
-fn v3(a: [f32; 3]) -> Vector3<f32> {
-    Vector3::new(a[0], a[1], a[2])
-}
-
 /// Latest raw sensor inputs, shared between the producer tasks and the fusion consumer. Holds
 /// *raw* values only — all interpretation (averaging, pressure→altitude, axis remap) is deferred
 /// to `Fusion`, so the producer tasks carry no fusion concern. The IMU is kept as a running sum +
@@ -136,16 +131,23 @@ impl Fusion {
         }
     }
 
-    /// Map sensor axes → the body frame the AHRS `Convention` expects. The single documented place
-    /// for any board-mount remap / sign-flip. Identity until validated on hardware (see CLAUDE.md
-    /// "Sensors — Fusion" and the README roadmap note).
+    /// Map sensor axes → the NWU body frame the AHRS expects. The single documented place for the
+    /// board-mount remap.
+    ///
+    /// ARK FPV mount (verified on hardware): flat & level the IIM-42653 reads accel ≈ (0, 0, −1) g,
+    /// i.e. its +Z points *down*, so the sensor frame is rotated 180° about X from the body frame
+    /// (which left the AHRS reporting roll ≈ 180° level). Undo it with the same 180°-about-X
+    /// rotation `(x, y, z) → (x, −y, −z)` — a proper rotation (det +1), so gyro handedness and yaw
+    /// direction stay consistent. Applied to all three sensors; the mag is assumed co-framed with
+    /// the IMU here — revisit this if the yaw *heading* turns out wrong (roll/pitch are unaffected).
     #[inline]
     fn to_body_frame(
         gyro_dps: [f32; 3],
         accel_g: [f32; 3],
         field_ut: [f32; 3],
     ) -> (Vector3<f32>, Vector3<f32>, Vector3<f32>) {
-        (v3(gyro_dps), v3(accel_g), v3(field_ut))
+        let flip = |v: [f32; 3]| Vector3::new(v[0], -v[1], -v[2]);
+        (flip(gyro_dps), flip(accel_g), flip(field_ut))
     }
 
     /// One fusion step. `imu` is the accumulated *mean* over `dt`; `mag` and `pressure_hpa` are the
@@ -173,7 +175,10 @@ impl Fusion {
         if let Some(p_hpa) = pressure_hpa {
             let alt = pressure_to_altitude_m(p_hpa, config::P0_REFERENCE);
             if !self.alt_seeded {
-                self.altitude.reset(alt); // relative-altitude zero at first valid sample
+                // Seed the filter to the current baro altitude so it starts converged rather than
+                // ramping up from 0. This is absolute ISA altitude (relative to P0_REFERENCE), not
+                // a re-zero — vertical velocity is a derivative and unaffected by the offset.
+                self.altitude.reset(alt);
                 self.alt_seeded = true;
             }
             let vertical_accel = self.ahrs.earth_acceleration().z * GRAVITY; // g → m/s²
