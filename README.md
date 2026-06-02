@@ -62,47 +62,89 @@ The transport, dev loop, all three onboard sensors, and sensor fusion are up.
 See [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md) for the full pin map — sensors, UARTs,
 motor outputs, and ADC power monitoring.
 
+## Prerequisites
+
+Host tooling (developed on macOS; Linux is the same — substitute the serial-device path, e.g.
+`/dev/ttyACM*`):
+
+- **Rust toolchain** — stable `rustc ≥ 1.85` (this crate is **edition 2024**). Install via
+  [rustup](https://rustup.rs).
+- **Bare-metal target:** `rustup target add thumbv7em-none-eabihf` (Cortex-M7F; pinned in
+  [`.cargo/config.toml`](.cargo/config.toml), so a plain `cargo build` cross-compiles).
+- **`cargo-binutils` + LLVM tools** — for `cargo objcopy` (ELF → raw `firmware.bin`):
+  `cargo install cargo-binutils && rustup component add llvm-tools-preview`.
+- **[`dfu-util`](https://dfu-util.sourceforge.net/)** ≥ 0.9 — flashes over USB DFU
+  (`brew install dfu-util`, or `apt install dfu-util`).
+- **[`just`](https://github.com/casey/just)** *(optional)* — wraps the build/flash/monitor flows
+  (`brew install just`); the raw commands below work without it.
+- **Hardware access:** a USB cable to the board, plus the **BOOT0** and **NRST** buttons/pads —
+  needed for the first flash and for recovery.
+- No `pyserial` required — the serial port is read with `stty` + `cat`.
+
 ## Build
 
-Target (`thumbv7em-none-eabihf`) and linker args are fixed in `.cargo/config.toml`, so plain
-cargo works:
+Target and linker args are fixed in `.cargo/config.toml`, so plain cargo cross-compiles:
 
 ```bash
 cargo build              # debug
 cargo build --release    # release — use this for flashing (smaller, faster)
 ```
 
-## Flash (USB DFU)
+## Flash & bring up the board
+
+The firmware runs from FLASH origin `0x08000000`; it's flashed as a raw binary over USB DFU. With
+`just` the whole flow is two commands (`just --list` shows all recipes):
 
 ```bash
-cargo objcopy --release -- -O binary firmware.bin   # needs cargo-binutils + llvm-tools
-printf 'r' > /dev/cu.usbmodem*                       # reboot running firmware into DFU (~2s)
-dfu-util -l                                          # confirm 0483:df11 (2 "Found DFU" lines)
-dfu-util -a 0 -s 0x08000000:leave -D firmware.bin    # flash to FLASH origin, then leave
+just flash      # release build → objcopy → dfu-util download (board must already be in DFU)
+just monitor    # read the serial port
 ```
 
-Two ways into DFU:
+The raw steps below are the source of truth for the gotchas.
 
-- **`r` over the serial port** (preferred) — the firmware reboots itself into the ROM bootloader.
-- **BOOT0 + RESET** (manual) — always works, even when firmware is hung; use for the first DFU
-  flash of a build or to recover a bricked boot.
+### 1. Get the board into DFU mode
 
-After flashing, **press NRST manually**: the `:leave` auto-run is unreliable on this H7 ROM
-bootloader and often leaves the app hung. macOS also re-enumerates the CDC port slowly (~15s) —
-poll, don't assume failure. The `Error during download get_status` (on leave) and
-`Invalid DFU suffix signature` warnings are both benign.
+- **First flash of a board, or recovery — BOOT0 + NRST (always works):** hold **BOOT0**, tap
+  **NRST**, release BOOT0. Use this for the very first flash (the `r` trick below needs already-
+  working firmware) and any time the board is hung.
+- **Reflashing — `r` over serial (no buttons):** `printf 'r' > /dev/cu.usbmodem*` — running
+  firmware reboots itself into the ROM bootloader (~2 s). **Not 100 % reliable on this H7**: it
+  occasionally lands in neither DFU nor CDC. If `dfu-util -l` shows nothing within ~15 s, fall back
+  to **BOOT0 + NRST**.
 
-## Verify
+Confirm DFU is up: `dfu-util -l` lists `0483:df11` (two "Found DFU" entries).
 
-There is no host test harness (`#![no_std]`). Verify by reading the serial port:
+### 2. Flash
+
+```bash
+cargo objcopy --release -- -O binary firmware.bin   # ELF → raw image
+dfu-util -a 0 -s 0x08000000:leave -D firmware.bin    # write to FLASH origin, then leave
+```
+
+Then **tap NRST to boot cleanly.** The `:leave` auto-run is unreliable on this H7 ROM bootloader
+and often leaves the app hung (no CDC, no LED) — a manual NRST always boots. macOS re-enumerates
+the CDC port slowly (up to ~15 s) — poll, don't assume failure. The
+`Error during download get_status` (on leave) and `Invalid DFU suffix signature` warnings are both
+**benign** (`File downloaded successfully` is the line that matters).
+
+### 3. Verify (first light)
+
+There is no host test harness (`#![no_std]`) — verify on the board by reading the serial port:
 
 ```bash
 stty -f /dev/cu.usbmodem* 115200 raw -echo
 cat /dev/cu.usbmodem*
 ```
 
-Expect `hello from RTIC on STM32H743, tick N` once per second, with the LEDs stepping
-red → green → blue in sync.
+Expect, once the CDC port enumerates:
+
+- `hello from RTIC on STM32H743, tick N` once per second, LEDs stepping red → green → blue in sync;
+- the sensor streams — `imu[...]`, `baro press=…hPa`, `mag field[uT]=…`, and fused
+  `fus roll=… pitch=… yaw=…deg alt=…m vz=…m/s`.
+
+`r` reboots into DFU for the next flash; `d` toggles verbose per-sensor diagnostics. See
+[`CLAUDE.md`](CLAUDE.md) for the deeper bring-up notes (USB clock path, reboot-to-DFU mechanism,
+per-sensor quirks, fusion axis/dt gotchas).
 
 ## Layout
 
