@@ -502,7 +502,7 @@ mod app {
     // nalgebra/libm math lives here at priority 1 — never in the imu_drdy ISR. `n` counts fused
     // states (for the log throttle). See CLAUDE.md "Sensors — Fusion".
     #[task(shared = [serial, latest, fused],
-           local = [fusion, last_ms: u32 = 0, have_last: bool = false, n: u32 = 0])]
+           local = [fusion, last_ms: Option<u32> = None, n: u32 = 0])]
     async fn fusion_step(mut cx: fusion_step::Context) {
         let period = (1_000 / config::FUSION_RATE_HZ).millis();
         loop {
@@ -515,14 +515,12 @@ mod app {
             // Measured dt (Mono is 1 kHz → ticks are ms). First iteration has no prior; use the
             // nominal period. Clamp to guard scheduling gaps from corrupting the velocity integral.
             let now_ms = Mono::now().ticks();
-            let dt = if *cx.local.have_last {
-                (now_ms.wrapping_sub(*cx.local.last_ms) as f32 / 1_000.0)
-                    .clamp(config::FUSION_DT_MIN_S, config::FUSION_DT_MAX_S)
-            } else {
-                *cx.local.have_last = true;
-                1.0 / config::FUSION_RATE_HZ as f32
+            let dt = match *cx.local.last_ms {
+                Some(prev_ms) => (now_ms.wrapping_sub(prev_ms) as f32 / 1_000.0)
+                    .clamp(config::FUSION_DT_MIN_S, config::FUSION_DT_MAX_S),
+                None => 1.0 / config::FUSION_RATE_HZ as f32,
             };
-            *cx.local.last_ms = now_ms;
+            *cx.local.last_ms = Some(now_ms);
 
             // Gate on the gyro having started (no DRDY edges yet → nothing accumulated).
             if let Some(mean) = imu {
