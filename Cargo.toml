@@ -1,7 +1,8 @@
 [package]
 name = "ark-discovery"
 version = "0.1.0"
-edition = "2021"
+# edition 2024 to match the fusion-ahrs / fusion-altitude crates (both edition 2024, rustc >= 1.85).
+edition = "2024"
 
 [dependencies]
 cortex-m = "0.7"
@@ -20,3 +21,11 @@ stm32h7xx-hal = { version = "0.16", features = [
 usb-device = "0.3"
 usbd-serial = "0.2"
 heapless = "0.8"
+
+# Sensor fusion. fusion-ahrs needs nalgebra (no_std via libm); declare nalgebra directly, pinned to
+# the same version/features so Cargo unifies to one copy. libm provides powf for the baro→altitude
+# formula (powf is std-only). See CLAUDE.md "Sensors — Fusion".
+fusion-ahrs = "0.6"
+fusion-altitude = "0.1"
+nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
+libm = "0.2"

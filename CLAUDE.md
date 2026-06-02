@@ -12,6 +12,15 @@ Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight control
 
 Do feature work on a new branch off `main` — never commit directly to `main`. Branch first (`git switch -c <name>`), then commit; land via PR.
 
+## Keep the docs current
+
+`README.md` (what the project does, for a reader) and this `CLAUDE.md` (how to work in it, for the next agent) are part of the deliverable, not an afterthought. **Update both in the same change as the code whenever the change is user- or contributor-visible** — a new sensor/driver/module, a new task or command, a config knob, a build/flash step, a dependency or toolchain bump, or a hard-won gotcha discovered on hardware. Don't leave them stale or defer to a follow-up.
+
+- **`README.md`** — keep the sensor table, "Current state" bullets, roadmap, `## Layout`, and `## References` in sync. New sensor/library → add a row, a state bullet, and a References entry; finished roadmap item → move it from roadmap to current state.
+- **`CLAUDE.md`** — add/extend the relevant `## Sensors — …` or subsystem section with the register/protocol facts and **what bit us** (the "plausible but frozen", interrupt-storm, axis-mismatch class of notes is the highest-value content here). Correct any statement a hardware result proves wrong, rather than layering a caveat on top.
+
+A quick heuristic: if a reviewer reading only the diff would be surprised the docs weren't touched, touch them.
+
 ## Code style
 
 Keep the code clean as it grows:
@@ -137,6 +146,21 @@ Third sensor. Register-level I2C4 driver, no external crate; composes the shared
 - Data: 6 bytes from OUTX_L (`0x68`), **little-endian** two's complement, X/Y/Z; temperature 2 bytes from `0x6E`. Scaling (ST `lis2mdl_reg.c`): **1.5 mgauss/LSB** — reported in **µT** as `raw * 0.15` (1 gauss = 100 µT); temp = `raw/8 + 25 °C`.
 - **Rates in [`src/config.rs`](src/config.rs)**: `MAG_ODR` (native 10/20/50/100 Hz) + sample/log throttle. Polled like the baro (50 Hz), decoupled from logging. `data_ready()` (STATUS_REG `0x67` Zyxda bit3) is available but unused — we poll at the ODR with BDU.
 - Sanity check on hardware (verified): field magnitude ≈ 25–65 µT (Earth's field; ~46 µT observed in a clean spot); a magnet or motor nearby swings it hard. Temp tracks the die (~31–38 °C observed), biased high near the H7 like the baro. **Magnitude is very sensitive to ambient hard-iron — on a metal/cluttered bench it reads 2–3× Earth's field (≈130 µT seen, steady X+Z bias, Y≈0) with no driver fault.** So when validating the mag, the *liveness* checks (data changing on all axes, temp real and ≠ exactly 25.0 °C) are the real "it works" signal; an out-of-range *magnitude* alone usually just means move the board away from metal and recheck.
+
+## Sensor fusion (`src/fusion.rs`)
+
+Fuses all three sensors into **attitude** (roll/pitch/yaw) via the [`fusion-ahrs`](https://github.com/wboayue/fusion-ahrs) crate and **altitude + vertical velocity** via [`fusion-altitude`](https://github.com/wboayue/fusion-altitude). `Fusion` wraps both estimators behind one `update(&ImuSample, Option<&MagSample>, Option<f32> pressure, dt) -> FusedState`; the `fusion_step` RTIC task just orchestrates (drain → update → store → log). Logs a throttled `fus roll=… pitch=… yaw=…deg alt=…m vz=…m/s` line and stores the latest `FusedState` in a `#[shared]` resource for a future control loop.
+
+- **Unit match is exact** — the libraries want gyro **dps**, accel **g**, mag **µT**, which `ImuSample`/`MagSample` already produce; no conversion. `fusion-altitude` wants metres + gravity-compensated earth-frame +up m/s²: altitude comes from `pressure_to_altitude_m` (ISA formula `44330*(1-(p/p0)^(1/5.255))`, `libm::powf` since `powf` is std-only), and vertical accel from `ahrs.earth_acceleration().z * GRAVITY` (earth_acceleration is in g; `GRAVITY = 9.806_65`).
+- **Delta-angle downsampling — the key architectural choice.** `imu_drdy` (1 kHz, priority 2) keeps its thin job but *also* accumulates running gyro/accel/temp **sums** into the shared `SensorState` (pure adds — no trig/nalgebra in the ISR). The `fusion_step` task (250 Hz, priority 1) drains the **mean** (`SensorState::drain_imu` → a real mean `ImuSample`) and runs the AHRS on it. This keeps full 1 kHz gyro fidelity (no aliasing) while all heavy `libm`/`nalgebra` math stays off the storm-sensitive latched-interrupt ISR. CPU cost is negligible (~0.1–0.3%); the reason to keep math out of `imu_drdy` is worst-case ISR latency / the interrupt-storm margin, not total CPU. After wiring fusion in, re-verify the DRDY counter still advances by exactly `IMU_LOG_DIV` per logged line (no storm).
+- **Transport** is one `#[shared] latest: SensorState` copied in/out under `.lock()` (latest-wins, no queue). `imu_drdy` (prio 2) also touches it, so its ceiling rises to prio 2 — every critical section must be a tiny copy/adds, **never fusion math** (the math runs outside the lock). `SensorState` holds *raw* values only; all interpretation (averaging, pressure→altitude, axis remap) lives in `fusion.rs`, so the producer tasks stay fusion-agnostic.
+- **9-DOF vs 6-DOF**: `config::FUSION_USE_MAG`. 9-DOF (`ahrs.update`) gives absolute yaw from the mag; 6-DOF (`ahrs.update_no_magnetometer`) drops the mag so yaw is relative and drifts. Flip to 6-DOF on a hard-iron bench to validate roll/pitch independently of bench yaw error.
+- **Altitude is absolute ISA**, not re-zeroed: fixed `P0_REFERENCE = 1013.25` hPa; on the first valid baro sample `Fusion::update` *seeds* the estimator (`reset(baro_alt)`) so it starts converged at the current ISA altitude (≈145 m observed at ~996 hPa) rather than ramping from 0. Vertical velocity is a derivative, unaffected by the P0 offset — vz is the operationally meaningful signal. Set a local QNH in `P0_REFERENCE` for true MSL.
+- **dt** is measured from `Mono::now().ticks()` deltas (1 kHz monotonic → ms), clamped to `[FUSION_DT_MIN_S, FUSION_DT_MAX_S]`. The 1 ms tick resolution caps the usable fusion rate (~250–333 Hz, so dt stays ≥3 ticks); a faster loop would need a finer `systick_monotonic!(Mono, …)`.
+- **`AltitudeSettings` is `#[non_exhaustive]`** — construct via `default()` then assign fields, not a struct literal (a literal is a compile error outside the crate). `AhrsSettings` is a plain struct (literal fine).
+- **edition 2024**: this crate is edition 2024 (both fusion crates are; needs rustc ≥ 1.85). The migration made `#[link_section]` an unsafe attribute → it's now `#[unsafe(link_section = …)]` on `BOOT_FLAG`.
+- **Axis/convention (`Fusion::to_body_frame`)**: `Convention::Nwu`. The ARK FPV's IIM-42653 reads accel ≈ (0,0,**−1**) g flat & level (its +Z points down), so `to_body_frame` applies a **180°-about-X** rotation `(x,−y,−z)` to gyro/accel/mag (verified on hardware — without it the AHRS reported roll ≈ 180° level). The mag is assumed co-framed with the IMU; if the yaw *heading* is wrong (roll/pitch unaffected) the mag needs its own remap. Rates/gains live in [`src/config.rs`](src/config.rs) under `// --- Fusion ---`.
+- Sanity check on hardware: level at rest → roll/pitch ≈ 0 after ~1–2 s convergence, alt tracks absolute ISA height (~145 m at ~996 hPa, *not* 0), vz ≈ 0. A steadily growing vz ⇒ dt error or earth-accel sign/scale bug (at rest `earth_acceleration().z*GRAVITY` should be ≈0, **not** ≈9.81). Bench yaw may be biased by hard-iron even when correct — judge yaw by *tracking direction*, not absolute heading.
 
 ## Reboot to DFU (`r` command)
 

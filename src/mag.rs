@@ -79,6 +79,7 @@ impl MagOdr {
 }
 
 /// One scaled sample.
+#[derive(Clone, Copy)]
 pub struct MagSample {
     pub field_ut: [f32; 3],
     pub temp_c: f32,

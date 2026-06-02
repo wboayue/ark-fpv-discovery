@@ -5,6 +5,7 @@ use panic_halt as _;
 
 mod baro;
 mod config;
+mod fusion;
 mod i2c_regs;
 mod imu;
 mod mag;
@@ -60,7 +61,7 @@ const SYSTEM_BOOTLOADER: *const u32 = 0x1FF0_9800 as *const u32;
 
 /// Lives in `.uninit`, which cortex-m-rt does NOT zero, so it survives the soft
 /// reset that carries the request from the running app into `pre_init`.
-#[link_section = ".uninit.BOOT_FLAG"]
+#[unsafe(link_section = ".uninit.BOOT_FLAG")]
 static mut BOOT_FLAG: core::mem::MaybeUninit<u32> = core::mem::MaybeUninit::uninit();
 
 #[inline(always)]
@@ -91,6 +92,7 @@ fn maybe_enter_bootloader() {
 mod app {
     use super::*;
     use crate::baro::{Baro, CHIP_ID_BMP388, CHIP_ID_BMP390};
+    use crate::fusion::{FusedState, Fusion, SensorState};
     use crate::imu::{Imu, ImuSample};
     use crate::mag::Mag;
 
@@ -129,6 +131,11 @@ mod app {
     struct Shared {
         usb_dev: UsbDevice<'static, UsbBus<USB2>>,
         serial: SerialPort<'static, UsbBus<USB2>>,
+        // Latest raw sensor inputs: producers write, the fusion task drains. imu_drdy (prio 2)
+        // also touches this, so its ceiling is prio 2 — keep every critical section tiny.
+        latest: SensorState,
+        // Latest fused estimate, for a future control loop to read.
+        fused: FusedState,
     }
 
     #[local]
@@ -140,6 +147,7 @@ mod app {
         imu_id: u8,
         baro: Baro,
         mag: Mag,
+        fusion: Fusion,
     }
 
     #[init(local = [
@@ -239,6 +247,10 @@ mod app {
         );
         let mag = Mag::new(i2c4);
 
+        // Sensor fusion (attitude + altitude). Owned by the fusion_step task; fed by the latest
+        // IMU/mag/baro samples. 9-DOF vs 6-DOF is config::FUSION_USE_MAG.
+        let fusion = Fusion::new(config::FUSION_USE_MAG);
+
         // PA11 = USB DM, PA12 = USB DP
         let usb_dm = gpioa.pa11.into_alternate();
         let usb_dp = gpioa.pa12.into_alternate();
@@ -273,11 +285,12 @@ mod app {
         log_tick::spawn().ok();
         baro_sample::spawn().ok();
         mag_sample::spawn().ok();
+        fusion_step::spawn().ok();
         // The IMU loop is driven by the DRDY interrupt (EXTI2), not spawned here.
 
         (
-            Shared { usb_dev, serial },
-            Local { counter: 0, leds, imu, imu_drdy, imu_id, baro, mag },
+            Shared { usb_dev, serial, latest: SensorState::default(), fused: FusedState::default() },
+            Local { counter: 0, leds, imu, imu_drdy, imu_id, baro, mag, fusion },
         )
     }
 
@@ -331,11 +344,14 @@ mod app {
     // future control law runs here; for now it reads the sample and hands every Nth one to the
     // low-priority logger so USB never gates the fast path. `n` counts DRDY events (lets us
     // confirm the real loop rate from the logged value).
-    #[task(binds = EXTI2, priority = 2, local = [imu, imu_drdy, imu_id, n: u32 = 0])]
-    fn imu_drdy(cx: imu_drdy::Context) {
+    #[task(binds = EXTI2, priority = 2, shared = [latest], local = [imu, imu_drdy, imu_id, n: u32 = 0])]
+    fn imu_drdy(mut cx: imu_drdy::Context) {
         cx.local.imu_drdy.clear_interrupt_pending_bit();
         let s = cx.local.imu.read();
         cx.local.imu.clear_interrupt(); // read INT_STATUS → drop the latched INT1 line
+        // Hand the sample to the fusion path: accumulate into the running sum (pure adds, no math)
+        // for delta-angle downsampling. This is the only fast-loop work added — keep it this short.
+        cx.shared.latest.lock(|st| st.accumulate(&s));
         // (control step goes here)
         *cx.local.n = cx.local.n.wrapping_add(1);
         if *cx.local.n % config::IMU_LOG_DIV == 0 {
@@ -367,7 +383,7 @@ mod app {
 
     // Bring up the BMP388/BMP390 barometer (polled) and stream pressure/temp. Sample rate and
     // log rate come from `config` and are decoupled (sampled fast, logged every Nth).
-    #[task(shared = [serial], local = [baro])]
+    #[task(shared = [serial, latest], local = [baro])]
     async fn baro_sample(mut cx: baro_sample::Context) {
         let baro = cx.local.baro;
 
@@ -403,6 +419,9 @@ mod app {
             let s = baro.read();
             n = n.wrapping_add(1);
 
+            // Stash raw pressure for fusion; the pressure→altitude conversion stays in fusion.rs.
+            cx.shared.latest.lock(|st| st.set_pressure(s.pressure_hpa));
+
             if n % config::BARO_LOG_DIV == 0 {
                 log_fmt(
                     &mut cx.shared.serial,
@@ -416,7 +435,7 @@ mod app {
 
     // Bring up the IIS2MDC/LIS2MDL magnetometer (polled) and stream the field/temp. Sample and log
     // rates come from `config` and are decoupled (sampled fast, logged every Nth), like the baro.
-    #[task(shared = [serial], local = [mag])]
+    #[task(shared = [serial, latest], local = [mag])]
     async fn mag_sample(mut cx: mag_sample::Context) {
         let mag = cx.local.mag;
 
@@ -447,6 +466,9 @@ mod app {
             let s = mag.read();
             n = n.wrapping_add(1);
 
+            // Stash the latest field for fusion (MagSample is Copy, so `s` is still usable below).
+            cx.shared.latest.lock(|state| state.set_mag(s));
+
             if n % config::MAG_LOG_DIV == 0 {
                 if diag_enabled() {
                     // Verbose, read-only: chip ID, the three config registers, and STATUS.
@@ -465,6 +487,57 @@ mod app {
                         format_args!(
                             "mag field[uT]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
                             s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c
+                        ),
+                    );
+                }
+            }
+
+            Mono::delay(period).await;
+        }
+    }
+
+    // Sensor fusion loop. Decoupled at FUSION_RATE_HZ: drains the IMU samples imu_drdy accumulated
+    // (delta-angle downsampling → full 1 kHz gyro fidelity at a 250 Hz estimator), folds in the
+    // latest mag/baro, stores the result for a future control loop, and logs it throttled. All the
+    // nalgebra/libm math lives here at priority 1 — never in the imu_drdy ISR. `n` counts fused
+    // states (for the log throttle). See CLAUDE.md "Sensors — Fusion".
+    #[task(shared = [serial, latest, fused],
+           local = [fusion, last_ms: Option<u32> = None, n: u32 = 0])]
+    async fn fusion_step(mut cx: fusion_step::Context) {
+        let period = (1_000 / config::FUSION_RATE_HZ).millis();
+        loop {
+            // One short critical section: copy out the IMU mean + latest mag/pressure, clear them.
+            let (imu, mag, pressure) = cx
+                .shared
+                .latest
+                .lock(|st| (st.drain_imu(), st.take_mag(), st.take_pressure()));
+
+            // Measured dt (Mono is 1 kHz → ticks are ms). First iteration has no prior; use the
+            // nominal period. Clamp to guard scheduling gaps from corrupting the velocity integral.
+            let now_ms = Mono::now().ticks();
+            let dt = match *cx.local.last_ms {
+                Some(prev_ms) => (now_ms.wrapping_sub(prev_ms) as f32 / 1_000.0)
+                    .clamp(config::FUSION_DT_MIN_S, config::FUSION_DT_MAX_S),
+                None => 1.0 / config::FUSION_RATE_HZ as f32,
+            };
+            *cx.local.last_ms = Some(now_ms);
+
+            // Gate on the gyro having started (no DRDY edges yet → nothing accumulated).
+            if let Some(mean) = imu {
+                let state = cx.local.fusion.update(&mean, mag.as_ref(), pressure, dt);
+                cx.shared.fused.lock(|f| *f = state);
+
+                *cx.local.n = cx.local.n.wrapping_add(1);
+                if *cx.local.n % config::FUSION_LOG_DIV == 0 {
+                    log_fmt(
+                        &mut cx.shared.serial,
+                        format_args!(
+                            "fus roll={:.1} pitch={:.1} yaw={:.1}deg alt={:.2}m vz={:.2}m/s\r\n",
+                            state.roll_deg,
+                            state.pitch_deg,
+                            state.yaw_deg,
+                            state.altitude_m,
+                            state.vertical_velocity
                         ),
                     );
                 }
