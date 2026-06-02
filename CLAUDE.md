@@ -12,6 +12,15 @@ Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight control
 
 Do feature work on a new branch off `main` — never commit directly to `main`. Branch first (`git switch -c <name>`), then commit; land via PR.
 
+## Keep the docs current
+
+`README.md` (what the project does, for a reader) and this `CLAUDE.md` (how to work in it, for the next agent) are part of the deliverable, not an afterthought. **Update both in the same change as the code whenever the change is user- or contributor-visible** — a new sensor/driver/module, a new task or command, a config knob, a build/flash step, a dependency or toolchain bump, or a hard-won gotcha discovered on hardware. Don't leave them stale or defer to a follow-up.
+
+- **`README.md`** — keep the sensor table, "Current state" bullets, roadmap, `## Layout`, and `## References` in sync. New sensor/library → add a row, a state bullet, and a References entry; finished roadmap item → move it from roadmap to current state.
+- **`CLAUDE.md`** — add/extend the relevant `## Sensors — …` or subsystem section with the register/protocol facts and **what bit us** (the "plausible but frozen", interrupt-storm, axis-mismatch class of notes is the highest-value content here). Correct any statement a hardware result proves wrong, rather than layering a caveat on top.
+
+A quick heuristic: if a reviewer reading only the diff would be surprised the docs weren't touched, touch them.
+
 ## Code style
 
 Keep the code clean as it grows:
