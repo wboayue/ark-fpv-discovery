@@ -1,0 +1,16 @@
+[package]
+name = "telem"
+version = "0.2.0"
+description = "Host-side reader/decoder for the ark-fpv-discovery binary telemetry stream (discovery-telemetry frames over USB CDC). NOT part of the firmware build — see the workspace note in the root Cargo.toml."
+license = "MIT"
+publish = false
+edition = "2024"
+
+[dependencies]
+# Single source of truth for the wire format — the same crate the firmware encodes with, so the
+# decoder can never drift from the encoder. We use codec::Decoder (streaming COBS + postcard).
+discovery-telemetry = "0.2.0"
+# Cross-platform serial port access (macOS /dev/cu.usbmodem*, Linux /dev/ttyACM*, Windows COM).
+serialport = "4"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

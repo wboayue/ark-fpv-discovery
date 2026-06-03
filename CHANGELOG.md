@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tools/telem` — host-side binary-telemetry decoder (workspace member, not part of the firmware build). Opens the serial port, sends `b`, and pretty-prints decoded `discovery-telemetry` frames. Run with `just telem`.
+
+### Changed
+
+- Repo is now a Cargo workspace (firmware at root + `tools/`); `default-members = ["."]` keeps the firmware/flash/release flow firmware-only.
+
 ## [0.2.0] - 2026-06-03
 
 ### Changed

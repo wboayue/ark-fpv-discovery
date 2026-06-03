@@ -58,6 +58,12 @@ monitor:
     stty -f "$tty" 115200 raw -echo
     cat "$tty"
 
+# Builds/runs the `telem` workspace tool for the HOST triple (never the embedded target). Pass a
+# port and/or flags directly (no leading `--`), e.g. `just telem /dev/cu.usbmodem0011 --no-switch`.
+# Decode the binary telemetry stream on the host (sends 'b', pretty-prints frames). Ctrl-C to stop.
+telem *args:
+    cargo run -p telem --target "$(rustc -vV | sed -n 's/^host: //p')" -- {{args}}
+
 # Send 'r' to reboot the running firmware into the ROM bootloader (no wait).
 reboot:
     #!/usr/bin/env bash
