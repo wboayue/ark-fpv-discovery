@@ -79,6 +79,37 @@ Gotchas, all learned the hard way in this codebase:
 
 There are no tests — `#![no_std]` firmware has no host test harness. The verification loop is: build, flash, then read the serial port (`stty -f <tty> 115200 raw -echo` then read it; pyserial is **not** installed) and confirm `hello from RTIC ... tick N` streams once/sec.
 
+## Releasing
+
+Tagged releases ship a prebuilt `firmware.bin` as a GitHub release asset so a flasher needn't have the Rust toolchain. `firmware.bin` is git-ignored (`*.bin`) — the **release asset is the canonical binary** for a tag; it is *not* reproducible from a plain checkout without rebuilding. Steps (run on `main`, clean tree, at the commit you want to ship):
+
+1. **Bump `version`** in `Cargo.toml` to match the tag (`cargo build` to refresh `Cargo.lock`), commit via PR.
+2. **Build the release binary** from that exact commit — the same `objcopy` the flash flow uses:
+   ```bash
+   cargo objcopy --release -- -O binary firmware.bin
+   ```
+3. **Tag (annotated) and push:**
+   ```bash
+   git tag -a v0.1.0 -m "ark-discovery v0.1.0 — <one-line summary>"
+   git push origin v0.1.0
+   ```
+4. **Compute the checksum** and put it in the notes (downloaders verify with the same command):
+   ```bash
+   shasum -a 256 firmware.bin
+   ```
+5. **Create the release and attach the binary:**
+   ```bash
+   gh release create v0.1.0 --title "v0.1.0 — <summary>" --notes-file <notes.md> --verify-tag
+   gh release upload v0.1.0 firmware.bin
+   ```
+6. **Verify the asset matches the local build** (catches a stale/wrong upload):
+   ```bash
+   gh release download v0.1.0 -R wboayue/ark-fpv-discovery --pattern firmware.bin --output /tmp/dl.bin
+   cmp /tmp/dl.bin firmware.bin && shasum -a 256 /tmp/dl.bin firmware.bin
+   ```
+
+Notes should state: it's a raw `objcopy` image (no DFU suffix), the flash command (`dfu-util -a 0 -s 0x08000000:leave -D firmware.bin`, then **tap NRST** — `:leave` auto-run is unreliable on this H7, see "Build & flash"), the SHA-256, and the honest hardware-status caveat (e.g. bench-verified / untested in flight). `gh release` commands need `-R wboayue/ark-fpv-discovery` when run outside the repo dir (e.g. from `/tmp`).
+
 ## Memory layout & clocks (the parts that bite)
 
 - `memory.x` defines the regions the linker uses: `FLASH @ 0x08000000` (2048K), `RAM @ 0x20000000` (128K). The DFU flash address above must match `FLASH ORIGIN`.
