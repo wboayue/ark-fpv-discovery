@@ -1,6 +1,7 @@
 [package]
 name = "ark-discovery"
 version = "0.1.0"
+license = "MIT"
 # edition 2024 to match the fusion-ahrs / fusion-altitude crates (both edition 2024, rustc >= 1.85).
 edition = "2024"
 

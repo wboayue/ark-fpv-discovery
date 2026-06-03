@@ -215,3 +215,7 @@ Datasheets and reference drivers the sensor code is built from. Local PDF copies
   observer for altitude + vertical velocity). The pressure→altitude step in `src/fusion.rs` uses the
   ISA/NOAA hypsometric formula `44330 * (1 - (p/p0)^(1/5.255))` (constants per the Bosch BMP3
   examples).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
