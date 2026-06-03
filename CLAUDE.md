@@ -175,7 +175,11 @@ Sending `r` over the serial link reboots into the ROM bootloader so the board ca
 
 ## Diagnostic mode (`d` command)
 
-Sending `d` over the serial link toggles verbose sensor diagnostics at runtime (and replies `diag on`/`diag off`). It flips a lock-free `static DIAG: AtomicBool` (read with `diag_enabled()`, no RTIC resource lock) which `usb_irq` toggles alongside the `r` handler. Currently `mag_sample` honors it: off → concise `mag field[uT]=… temp=…C`; on → `mag[diag] id=… cfgA=… B=… C=… field=… temp=… status=…` register dump (read-only — no side effects). Extensible to other tasks the same way. This is how the IIS2MDC continuous-mode-latch bug above was diagnosed on hardware without reflashing per probe.
+Sending `d` over the serial link toggles verbose sensor diagnostics at runtime (and replies `diag on`/`diag off`). It flips a lock-free `static DIAG: AtomicBool` (read with `diag_enabled()`, no RTIC resource lock) which `usb_irq` toggles alongside the `r` handler. Two tasks honor it (read-only, no side effects):
+- **`mag_sample`** — off → concise `mag field[uT]=… temp=…C`; on → `mag[diag] id=… cfgA=… B=… C=… field=… temp=… status=…` register dump. This is how the IIS2MDC continuous-mode-latch bug above was diagnosed on hardware without reflashing per probe.
+- **`fusion_step`** — off → concise `fus roll=… pitch=… yaw=…deg alt=…m vz=…m/s`; on → `fus[diag] … resid=…m vacc=…m/s2 bias=…m/s2`, surfacing the vertical-channel signals (baro innovation `resid`, gravity-compensated vertical accel `vacc`, estimated accel `bias`) for characterizing the baro disturbance — e.g. sizing `r0` for a future adaptive-baro-trust scheme from a props-on capture.
+
+Extensible to other tasks the same way.
 
 ## Naming note
 

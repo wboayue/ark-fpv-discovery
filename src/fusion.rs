@@ -34,6 +34,9 @@ pub struct FusedState {
     pub yaw_deg: f32,
     pub altitude_m: f32,
     pub vertical_velocity: f32,
+    /// Baro innovation (baro altitude − filtered altitude), m. The disturbance signal a future
+    /// adaptive-baro-trust scheme would gate on — log it to size the trust threshold (`r0`).
+    pub baro_residual: f32,
 }
 
 /// Latest raw sensor inputs, shared between the producer tasks and the fusion consumer. Holds
@@ -107,6 +110,9 @@ pub struct Fusion {
     /// Most recent baro altitude (m), held between baro samples so the altitude observer can run
     /// every fusion tick with continuous baro correction (it's slower than the fusion rate).
     baro_alt_m: f32,
+    /// Last gravity-compensated vertical acceleration fed to the altitude observer (m/s², +up).
+    /// Retained only for diagnostics (the `fus[diag]` line) — shows accel/vibration coupling.
+    vertical_accel_mps2: f32,
 }
 
 impl Fusion {
@@ -132,7 +138,17 @@ impl Fusion {
             use_mag,
             alt_seeded: false,
             baro_alt_m: 0.0,
+            vertical_accel_mps2: 0.0,
         }
+    }
+
+    /// Estimated accel bias (m/s²) — diagnostics: a drifting bias inflates the baro residual.
+    pub fn accel_bias(&self) -> f32 {
+        self.altitude.accel_bias()
+    }
+    /// Last gravity-compensated vertical accel (m/s², +up) — diagnostics: vibration coupling.
+    pub fn vertical_accel(&self) -> f32 {
+        self.vertical_accel_mps2
     }
 
     /// Map sensor axes → the NWU body frame the AHRS expects. The single documented place for the
@@ -196,6 +212,7 @@ impl Fusion {
         // standard complementary-filter structure. Vertical accel is gravity-compensated, +up (NWU).
         if self.alt_seeded {
             let vertical_accel = self.ahrs.earth_acceleration().z * GRAVITY; // g → m/s²
+            self.vertical_accel_mps2 = vertical_accel;
             self.altitude.update(vertical_accel, self.baro_alt_m, dt);
         }
 
@@ -205,6 +222,7 @@ impl Fusion {
             yaw_deg: yaw.to_degrees(),
             altitude_m: self.altitude.altitude(),
             vertical_velocity: self.altitude.vertical_velocity(),
+            baro_residual: self.altitude.baro_residual(),
         }
     }
 }
