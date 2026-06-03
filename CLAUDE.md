@@ -123,7 +123,7 @@ Everything lives in one `#[rtic::app]` module — there is no `main()`. Key conv
 - **`#[shared]` resources** (`usb_dev`, `serial`) are accessed only inside `.lock(|r| ...)` closures; RTIC enforces this for data-race freedom across priorities.
 - **`#[local]` resources** belong to exactly one task (e.g. `counter` in `log_tick`).
 - **`#[init]` local statics** (`ep_mem`, `usb_bus`) give `'static` backing storage for the USB allocator — the `usb_bus: Option<...> = None` + `.replace()` dance exists because the `SerialPort`/`UsbDevice` borrow from a bus that must outlive `init`.
-- **Tasks**: `usb_irq` (`binds = OTG_FS`) pumps `usb_dev.poll` and reads the CDC RX, where a `b'r'` byte triggers reboot-to-DFU. **`imu_drdy` (`binds = EXTI2`, `priority = 2`)** is the gyro-synchronous control loop — it fires on the IMU data-ready interrupt, reads a sample, acks it, and hands every Nth to `imu_log`. `log_tick`, `baro_sample`, `mag_sample`, and `imu_log` are `async` software tasks at the default priority (1); the high-priority `imu_drdy` never touches `serial`, so the fast loop is never blocked by USB. The `dispatchers = [FDCAN1_IT0]` list donates one interrupt vector for the priority-1 software tasks (enough while they share a priority) — add more for new priority levels.
+- **Tasks**: `usb_irq` (`binds = OTG_FS`) pumps `usb_dev.poll` and reads the CDC RX, dispatching control bytes `r` (reboot-to-DFU), `d` (toggle diagnostics), and `b`/`t` (binary/text output — see "Telemetry output"). **`imu_drdy` (`binds = EXTI2`, `priority = 2`)** is the gyro-synchronous control loop — it fires on the IMU data-ready interrupt, reads a sample, acks it, and hands every Nth to `imu_log`. `log_tick`, `baro_sample`, `mag_sample`, and `imu_log` are `async` software tasks at the default priority (1); the high-priority `imu_drdy` never touches `serial`, so the fast loop is never blocked by USB. The `dispatchers = [FDCAN1_IT0]` list donates one interrupt vector for the priority-1 software tasks (enough while they share a priority) — add more for new priority levels.
 - Timebase is SysTick via `systick_monotonic!(Mono, 1_000)` (1 kHz tick), started in `init` with the 400 MHz core clock.
 
 ## Status LEDs
@@ -206,9 +206,30 @@ Sending `r` over the serial link reboots into the ROM bootloader so the board ca
 
 **Do NOT move this jump into `#[cortex_m_rt::pre_init]`.** That ran before RAM init, was unsound, and bricked the boot (no CDC, no LED, not even DFU — only BOOT0 recovered it). Checking the flag at the top of `init` is the working approach.
 
+## Telemetry output: text / binary (`src/telemetry.rs`, `b`/`t` commands)
+
+All serial output goes through **`mod telemetry`** — the presentation layer. The RTIC tasks stay thin: they call `log_imu` / `log_baro` / `log_mag` / `log_fused` (per-sample renderers) or `emit_line` (status/notice lines) and never hand-roll a `String`/`write!`/`serial.write` or touch the wire codec. Two runtime-selectable modes:
+
+- **Text** (boot default, `config::DEFAULT_OUTPUT_BINARY = false`): today's human-readable `\r\n` lines. A terminal user (`screen`, `just monitor`) sees readable output with zero setup.
+- **Binary**: postcard-encoded, COBS-framed [`discovery-telemetry`](https://github.com/wboayue/discovery-telemetry) `Frame`s, decoded losslessly by the host scope. Each `log_*` helper maps the sample 1:1 onto the wire payload (`ImuSample`→`wire::Imu`, etc.; note the `FusedState` field renames `vertical_velocity → vertical_speed_mps`, `baro_residual → baro_residual_m`).
+
+The output mode is a lock-free `static OUTPUT_BINARY: AtomicBool` (mirrors `DIAG`), read via `output_is_binary()`. Control bytes in `usb_irq` (alongside `r`/`d`):
+
+| Byte | Action |
+|---|---|
+| `b` | switch to **binary**; emits a `Hello` frame first (scope confirms the switch + checks `PROTOCOL_VERSION`) |
+| `t` | switch to **text** (replies `text mode`) |
+
+- **The status-message gap this closes.** The firmware's non-data lines (mode acks, sensor bring-up identity, errors like `baro: invalid ODR/OSR`) had no binary form — in a binary stream they'd be injected as raw text and dropped by the decoder. `discovery-telemetry` v0.2.0 adds `Msg::Status { level, text }`; `emit_line(serial, level, args)` renders one line as a `Status` frame (binary) or a text line (text). `PROTOCOL_VERSION` is **2**.
+- **Encoding is split from the serial lock** — the hard-won bit. `usb_irq` runs *inside* `serial.lock`, and re-locking the same RTIC resource deadlocks. So the spawned tasks (which hold a `Mutex` proxy) use the locking `emit_frame`/`emit_line`/`log_*` wrappers, while `usb_irq` builds bytes with `encode_frame` and writes the **already-unlocked** port via `write_frame` directly. Never call a `&mut impl SerialMutex` helper from `usb_irq`.
+- **`Hello.fw_git`** is the short git commit, injected at build time by `build.rs` (`GIT_HASH`, capped to 7 chars + NUL = `[u8; 8]`; `"unknown"` if `git` is unavailable). `Hello.board = Board::ArkDiscovery`.
+- **DTR-revert:** `usb_irq` watches `serial.dtr()`; on a true→false transition (host/scope closed the port) it reverts to text, so the next terminal user gets readable lines without sending `t`. Best-effort (not every host signals on close; a re-enumeration also trips it).
+- **Frame buffer:** `encode_frame` owns the one `[u8; codec::MAX_FRAME]` (64) buffer, as `log_fmt` owns `LOG_LINE_CAP`. `Status` (`text:[u8;48]`) is the largest frame (~57 B framed). **Partial USB writes are accepted as lossy:** a frame truncated by a full endpoint is dropped and the decoder resyncs at the next `0x00` (the protocol has no reliability layer — USB CDC already gives link-layer CRC + retransmit).
+- After wiring binary in, **re-verify no interrupt storm**: the DRDY counter still advances by exactly `IMU_LOG_DIV` per logged sample (binary emit is all priority-1; `imu_drdy` never touches `serial`).
+
 ## Diagnostic mode (`d` command)
 
-Sending `d` over the serial link toggles verbose sensor diagnostics at runtime (and replies `diag on`/`diag off`). It flips a lock-free `static DIAG: AtomicBool` (read with `diag_enabled()`, no RTIC resource lock) which `usb_irq` toggles alongside the `r` handler. Two tasks honor it (read-only, no side effects):
+Sending `d` over the serial link toggles verbose sensor diagnostics at runtime. It flips a lock-free `static DIAG: AtomicBool` (in `telemetry`, read with `diag_enabled()`, no RTIC resource lock) which `usb_irq` toggles alongside the `r`/`b`/`t` handlers. The `d` **ack** itself honors the output mode: a `Status` frame in binary, the `diag on`/`diag off` text line otherwise. Two tasks honor the flag in **text mode** (the verbose dumps read live driver registers / estimator internals, so they're text-only and stay in the task; binary mode always emits the plain data frame):
 - **`mag_sample`** — off → concise `mag field[uT]=… temp=…C`; on → `mag[diag] id=… cfgA=… B=… C=… field=… temp=… status=…` register dump. This is how the IIS2MDC continuous-mode-latch bug above was diagnosed on hardware without reflashing per probe.
 - **`fusion_step`** — off → concise `fus roll=… pitch=… yaw=…deg alt=…m vz=…m/s`; on → `fus[diag] … resid=…m vacc=…m/s2 bias=…m/s2`, surfacing the vertical-channel signals (baro innovation `resid`, gravity-compensated vertical accel `vacc`, estimated accel `bias`) for characterizing the baro disturbance — e.g. sizing `r0` for a future adaptive-baro-trust scheme from a props-on capture.
 

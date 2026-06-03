@@ -31,6 +31,11 @@ usb-device = "0.3"
 usbd-serial = "0.2"
 heapless = "0.8"
 
+# Shared firmware<->host telemetry wire format (postcard + COBS frames). We only call its
+# codec::encode (which wraps postcard), so no direct postcard/serde dep is needed here.
+# TODO: pin to `tag = "v0.2.0"` once that tag is pushed; path dep during local bring-up.
+discovery-telemetry = { path = "../discovery-telemetry" }
+
 # Sensor fusion. fusion-ahrs needs nalgebra (no_std via libm); declare nalgebra directly, pinned to
 # the same version/features so Cargo unifies to one copy. libm provides powf for the baro→altitude
 # formula (powf is std-only). See CLAUDE.md "Sensors — Fusion".
