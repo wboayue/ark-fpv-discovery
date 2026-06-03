@@ -13,6 +13,17 @@ publish = false
 # edition 2024 to match the fusion-ahrs / fusion-altitude crates (both edition 2024, rustc >= 1.85).
 edition = "2024"
 
+# Workspace: the firmware crate (this root package) plus host-side tools that must NEVER be part
+# of the firmware build. `default-members = ["."]` makes a bare `cargo build` / `cargo objcopy`
+# (and the whole flash/release flow) touch ONLY the firmware — the embedded target in
+# `.cargo/config.toml` never tries to compile a std host tool. Build a tool explicitly, for the
+# host triple, e.g. `cargo run -p telem --target $(rustc -vV | sed -n 's/^host: //p')` (or `just telem`).
+# Do NOT `cargo build --workspace` here — that would try to build the host tools for thumbv7em.
+[workspace]
+members = ["tools/telem"]
+default-members = ["."]
+resolver = "3"
+
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"

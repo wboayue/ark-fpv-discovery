@@ -72,6 +72,10 @@ The transport, dev loop, all three onboard sensors, and sensor fusion are up.
   ([`discovery-telemetry`](https://github.com/wboayue/discovery-telemetry) wire format, decoded
   losslessly by the host scope), `t` switches back. Status/event lines (mode acks, sensor
   bring-up, errors) ride a `Status` frame in binary. Reverts to text when the host closes the port.
+- **`telem` host decoder** (`tools/telem`): a small `std` host tool (a workspace member, **not** part
+  of the firmware build) that opens the serial port, sends `b`, and pretty-prints the decoded binary
+  frames. Decodes with the same `discovery-telemetry` crate the firmware encodes with, so it doubles
+  as a reference decoder. Run with `just telem` (or `cargo run -p telem --target <host-triple>`).
 - Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing; `d`
   toggles verbose per-sensor diagnostics (register dumps) at runtime.
 - **Roadmap:** the `discovery-scope` host viewer (the visualization half of the series) consuming
@@ -113,6 +117,16 @@ Target and linker args are fixed in `.cargo/config.toml`, so plain cargo cross-c
 ```bash
 cargo build              # debug
 cargo build --release    # release — use this for flashing (smaller, faster)
+```
+
+This is a Cargo workspace (firmware at the root + host tools under `tools/`), but
+`default-members` is the firmware crate alone, so a bare `cargo build`/`cargo objcopy` and the whole
+flash/release flow only ever build the firmware for the embedded target. Host tools build for the
+**host** triple and must be named explicitly — don't run `cargo build --workspace` (it would try to
+cross-compile the std host tools for the MCU). Build/run the telemetry decoder with `just telem`, or:
+
+```bash
+cargo run -p telem --target "$(rustc -vV | sed -n 's/^host: //p')"
 ```
 
 ## Flash & bring up the board
@@ -182,6 +196,7 @@ per-sensor quirks, fusion axis/dt gotchas).
 | `src/fusion.rs`          | Sensor fusion: attitude (fusion-ahrs) + altitude (fusion-altitude) |
 | `src/telemetry.rs`       | Serial output layer: text logging + binary (`discovery-telemetry`) framing, `b`/`t`/`d` mode flags |
 | `src/config.rs`          | Tunable sensor/loop rates, fusion gains, output-mode default |
+| `tools/telem/`           | Host (`std`) binary-telemetry decoder — workspace member, not in the firmware build |
 | `build.rs`               | Injects the short git commit (`GIT_HASH`) for the telemetry `Hello` frame |
 | `memory.x`               | Linker regions: FLASH @ `0x08000000`, RAM @ `0x20000000` |
 | `.cargo/config.toml`     | Target + linker args                             |

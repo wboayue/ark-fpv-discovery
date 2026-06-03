@@ -80,6 +80,15 @@ Gotchas, all learned the hard way in this codebase:
 
 There are no tests — `#![no_std]` firmware has no host test harness. The verification loop is: build, flash, then read the serial port (`stty -f <tty> 115200 raw -echo` then read it; pyserial is **not** installed) and confirm `hello from RTIC ... tick N` streams once/sec.
 
+## Workspace & host tools (`tools/`)
+
+The repo is a **Cargo workspace**: the firmware crate is the root package, host-side (`std`) tools live under `tools/`. The whole point is isolation — **the firmware build must never compile a host tool** (different std-ness, different target). How that's enforced, and the traps:
+
+- **`default-members = ["."]` in the root `[workspace]`** is what keeps it clean: a bare `cargo build`, `cargo objcopy`, and the entire flash/release flow act on the firmware crate alone, for the `thumbv7em-none-eabihf` target pinned in `.cargo/config.toml`. A host tool is never in that set, so it's never cross-compiled to the MCU.
+- **Never run `cargo build --workspace` here** — it ignores `default-members` and tries to build the std host tools for `thumbv7em`, which fails (no std for the target). Same for `cargo test --workspace`. Build/run a tool **explicitly and for the host triple**: `cargo run -p telem --target "$(rustc -vV | sed -n 's/^host: //p')"` (wrapped as `just telem`). The `--target <host>` is **mandatory** — without it, `.cargo/config.toml`'s `build.target` makes cargo try to build the std tool for the MCU.
+- **`tools/telem`** — the binary-telemetry decoder. Opens the CDC serial port (`serialport` crate), sends `b` to switch the firmware to binary, then runs `discovery_telemetry::codec::Decoder` (streaming COBS + postcard) over the byte stream and pretty-prints each `Frame`. It depends on the **same `discovery-telemetry` crate the firmware encodes with**, so the decoder can't drift from the encoder — it doubles as the reference decoder for the wire format. The expected **1 dropped frame right after `b`** is the stale-text flush (see the `Hello`/`0x00`-flush note under "Telemetry output"), not a fault; persistent drops mean corruption or a `PROTOCOL_VERSION` skew. Closing the port drops DTR → firmware reverts to text, so no `t` needed on exit.
+- **Don't hand-roll a wire decoder** (we burned time doing exactly this in a shell/Python one-off): the envelope is `Frame { t_ms: u32 (postcard varint, *first*), msg }` — forgetting the leading `t_ms` varint is what made a hand decode look like it had a mystery 4-byte prefix. Use `codec::Decoder`; it's `no_std` and already handles framing + resync.
+
 ## Releasing
 
 Tagged releases ship a prebuilt `firmware.bin` as a GitHub release asset so a flasher needn't have the Rust toolchain. `firmware.bin` is git-ignored (`*.bin`) — the **release asset is the canonical binary** for a tag; it is *not* reproducible from a plain checkout without rebuilding. Steps (run on `main`, clean tree, at the commit you want to ship):
