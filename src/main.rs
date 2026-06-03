@@ -529,17 +529,38 @@ mod app {
 
                 *cx.local.n = cx.local.n.wrapping_add(1);
                 if *cx.local.n % config::FUSION_LOG_DIV == 0 {
-                    log_fmt(
-                        &mut cx.shared.serial,
-                        format_args!(
-                            "fus roll={:.1} pitch={:.1} yaw={:.1}deg alt={:.2}m vz={:.2}m/s\r\n",
-                            state.roll_deg,
-                            state.pitch_deg,
-                            state.yaw_deg,
-                            state.altitude_m,
-                            state.vertical_velocity
-                        ),
-                    );
+                    if diag_enabled() {
+                        // Verbose vertical-channel dump for characterizing the baro disturbance
+                        // (e.g. props-on): `resid` is the baro innovation that an adaptive-trust
+                        // scheme would gate on (sizes `r0`); `vacc` shows accel/vibration coupling;
+                        // `bias` the estimated accel bias (a drift here inflates `resid`).
+                        log_fmt(
+                            &mut cx.shared.serial,
+                            format_args!(
+                                "fus[diag] roll={:.1} pitch={:.1} yaw={:.1}deg alt={:.2}m vz={:.2}m/s resid={:.3}m vacc={:.2}m/s2 bias={:.3}m/s2\r\n",
+                                state.roll_deg,
+                                state.pitch_deg,
+                                state.yaw_deg,
+                                state.altitude_m,
+                                state.vertical_velocity,
+                                state.baro_residual,
+                                cx.local.fusion.vertical_accel(),
+                                cx.local.fusion.accel_bias()
+                            ),
+                        );
+                    } else {
+                        log_fmt(
+                            &mut cx.shared.serial,
+                            format_args!(
+                                "fus roll={:.1} pitch={:.1} yaw={:.1}deg alt={:.2}m vz={:.2}m/s\r\n",
+                                state.roll_deg,
+                                state.pitch_deg,
+                                state.yaw_deg,
+                                state.altitude_m,
+                                state.vertical_velocity
+                            ),
+                        );
+                    }
                 }
             }
 
