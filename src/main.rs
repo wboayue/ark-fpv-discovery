@@ -9,12 +9,9 @@ mod fusion;
 mod i2c_regs;
 mod imu;
 mod mag;
+mod telemetry;
 
-use heapless::String;
 use stm32h7xx_hal as hal;
-
-use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use hal::{
     gpio::{Edge, ErasedPin, ExtiPin, Input, Output, PinState, PushPull},
@@ -38,21 +35,9 @@ systick_monotonic!(Mono, 1_000);
 // --- Reboot-to-DFU support ----------------------------------------------------
 // Sending 'r' over the USB serial link reboots the board into the STM32 ROM
 // bootloader, so it can be reflashed with dfu-util without touching BOOT0/RESET.
-
-// --- Runtime diagnostic mode --------------------------------------------------
-// Toggled by the 'd' byte over USB serial (alongside 'r' for reboot-to-DFU). When on, sensor
-// tasks emit verbose register-level dumps instead of concise readings. Lock-free so any task can
-// read it without an RTIC resource lock.
-static DIAG: AtomicBool = AtomicBool::new(false);
-
-fn diag_enabled() -> bool {
-    DIAG.load(Ordering::Relaxed)
-}
-
-/// Flip the diagnostic flag; returns the new state.
-fn toggle_diag() -> bool {
-    !DIAG.fetch_xor(true, Ordering::Relaxed)
-}
+//
+// Serial output (text logging + binary telemetry framing) and the runtime diagnostic / output-mode
+// flags live in `mod telemetry`. The 'd'/'b'/'t' control bytes are dispatched in `usb_irq`.
 
 /// Written to `BOOT_FLAG` to request a ROM-bootloader jump on the next boot.
 const BOOTLOADER_MAGIC: u32 = 0xB007_0DF1;
@@ -95,31 +80,12 @@ mod app {
     use crate::fusion::{FusedState, Fusion, SensorState};
     use crate::imu::{Imu, ImuSample};
     use crate::mag::Mag;
-
-    /// Lock the shared USB serial port and write `msg`. Generic over the RTIC resource
-    /// proxy so every task shares one code path. Best-effort: write errors are dropped.
-    fn write_serial(serial: &mut impl rtic::Mutex<T = SerialPort<'static, UsbBus<USB2>>>, msg: &str) {
-        serial.lock(|serial| {
-            let _ = serial.write(msg.as_bytes());
-        });
-    }
-
-    /// Longest formatted log line we emit (the verbose mag diagnostic dump); sizes the buffer.
-    const LOG_LINE_CAP: usize = 192;
-
-    /// Format and write one line to the shared serial port. Collapses the repeated
-    /// `String::new()` / `write!` / `write_serial` boilerplate, owning the one buffer size so call
-    /// sites carry no magic number. Best-effort: a line longer than `LOG_LINE_CAP` is truncated and
-    /// write errors are dropped. Pass the message with `format_args!`, e.g.
-    /// `log_fmt(&mut cx.shared.serial, format_args!("tick {}", n))`.
-    fn log_fmt(
-        serial: &mut impl rtic::Mutex<T = SerialPort<'static, UsbBus<USB2>>>,
-        args: core::fmt::Arguments,
-    ) {
-        let mut msg: String<LOG_LINE_CAP> = String::new();
-        let _ = msg.write_fmt(args);
-        write_serial(serial, &msg);
-    }
+    use discovery_telemetry as wire;
+    // Serial output layer: text logging, binary framing, and the output-mode / diagnostic flags.
+    use crate::telemetry::{
+        diag_enabled, emit_frame, emit_line, fw_git, log_baro, log_fmt, log_fused, log_imu, log_mag,
+        output_is_binary, set_output_binary, status_msg, toggle_diag, write_frame,
+    };
 
     // Status LED indices into `Local::leds` — ARK FPV board pins PE3/PE4/PE5.
     // See docs/ark-fpv-board.md. log_tick cycles through them red→green→blue.
@@ -294,26 +260,75 @@ mod app {
         )
     }
 
-    #[task(binds = OTG_FS, shared = [usb_dev, serial])]
+    // Host→board control bytes (single ASCII): 'r' reboot-to-DFU, 'd' toggle diagnostics, 'b'/'t'
+    // switch output to binary/text frames. We run entirely inside `serial.lock`, so `serial` here
+    // is the *unlocked* port — control replies use `write_frame` directly (NOT the locking
+    // `emit_frame`, which would re-lock and deadlock). `last_dtr` drives the DTR-revert below.
+    #[task(binds = OTG_FS, shared = [usb_dev, serial], local = [last_dtr: bool = false])]
     fn usb_irq(mut cx: usb_irq::Context) {
+        let prev_dtr = *cx.local.last_dtr;
+        let mut dtr = prev_dtr;
+
         cx.shared.usb_dev.lock(|usb_dev| {
             cx.shared.serial.lock(|serial| {
                 if usb_dev.poll(&mut [serial]) {
                     let mut buf = [0u8; 32];
                     if let Ok(n) = serial.read(&mut buf) {
+                        let rx = &buf[..n];
                         // 'r' reboots into the ROM bootloader for dfu-util flashing (never returns).
-                        if buf[..n].contains(&b'r') {
+                        if rx.contains(&b'r') {
                             reboot_to_bootloader();
                         }
-                        // 'd' toggles verbose sensor diagnostics at runtime.
-                        if buf[..n].contains(&b'd') {
+                        // 'b'/'t' select binary/text output. On entering binary, emit Hello first
+                        // so the scope confirms the switch and checks the protocol version.
+                        if rx.contains(&b'b') {
+                            set_output_binary(true);
+                            // Flush the partial text line still sitting (delimiter-less) in the
+                            // host's COBS accumulator: a lone 0x00 closes it as one discarded
+                            // frame so the Hello below lands clean. Without this the Hello is
+                            // concatenated onto that text and dropped on resync — the host never
+                            // sees the version handshake. (Found on hardware.)
+                            let _ = serial.write(&[0x00]);
+                            write_frame(
+                                serial,
+                                wire::Msg::Hello(wire::Hello {
+                                    proto: wire::PROTOCOL_VERSION,
+                                    fw_git: fw_git(),
+                                    board: wire::Board::ArkDiscovery,
+                                }),
+                            );
+                        } else if rx.contains(&b't') {
+                            set_output_binary(false);
+                            let _ = serial.write(b"text mode\r\n");
+                        }
+                        // 'd' toggles verbose sensor diagnostics; ack in whichever mode is active.
+                        if rx.contains(&b'd') {
                             let on = toggle_diag();
-                            let _ = serial.write(if on { b"diag on\r\n" } else { b"diag off\r\n" });
+                            if output_is_binary() {
+                                write_frame(
+                                    serial,
+                                    status_msg(
+                                        wire::Level::Info,
+                                        format_args!("diag {}", if on { "on" } else { "off" }),
+                                    ),
+                                );
+                            } else {
+                                let _ = serial.write(if on { b"diag on\r\n" } else { b"diag off\r\n" });
+                            }
                         }
                     }
                 }
+                // DTR tracks the host opening/closing the port (updated by `poll`).
+                dtr = serial.dtr();
             });
         });
+
+        // Host disconnected (DTR true→false, e.g. the scope closed): revert to text so the next
+        // person opening a plain terminal sees readable lines without sending 't'.
+        if prev_dtr && !dtr {
+            set_output_binary(false);
+        }
+        *cx.local.last_dtr = dtr;
     }
 
     #[task(shared = [serial], local = [counter, leds])]
@@ -328,10 +343,14 @@ mod app {
                 led.set_state(PinState::from(SEQUENCE[step] != i));
             }
 
-            log_fmt(
-                &mut cx.shared.serial,
-                format_args!("hello from RTIC on STM32H743, tick {}\r\n", *cx.local.counter),
-            );
+            if output_is_binary() {
+                emit_frame(&mut cx.shared.serial, wire::Msg::Tick(*cx.local.counter));
+            } else {
+                log_fmt(
+                    &mut cx.shared.serial,
+                    format_args!("hello from RTIC on STM32H743, tick {}\r\n", *cx.local.counter),
+                );
+            }
 
             *cx.local.counter = cx.local.counter.wrapping_add(1);
 
@@ -363,22 +382,7 @@ mod app {
     // `n` is the DRDY count (confirms the real loop rate); `id` is the WHO_AM_I read at startup.
     #[task(shared = [serial])]
     async fn imu_log(mut cx: imu_log::Context, n: u32, id: u8, s: ImuSample) {
-        log_fmt(
-            &mut cx.shared.serial,
-            format_args!(
-                "imu[{}] id=0x{:02x}(exp {:02x}) accel[g]={:.2},{:.2},{:.2} gyro[dps]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
-                n,
-                id,
-                crate::imu::EXPECTED_WHO_AM_I,
-                s.accel_g[0],
-                s.accel_g[1],
-                s.accel_g[2],
-                s.gyro_dps[0],
-                s.gyro_dps[1],
-                s.gyro_dps[2],
-                s.temp_c
-            ),
-        );
+        log_imu(&mut cx.shared.serial, n, id, crate::imu::EXPECTED_WHO_AM_I, &s);
     }
 
     // Bring up the BMP388/BMP390 barometer (polled) and stream pressure/temp. Sample rate and
@@ -393,9 +397,10 @@ mod app {
             CHIP_ID_BMP390 => "BMP390",
             _ => "unknown",
         };
-        log_fmt(
+        emit_line(
             &mut cx.shared.serial,
-            format_args!("baro CHIP_ID=0x{:02x} ({})\r\n", id, part),
+            wire::Level::Info,
+            format_args!("baro CHIP_ID=0x{:02x} ({})", id, part),
         );
 
         // Reset, load calibration, and start normal-mode sampling (driver owns the timing).
@@ -406,9 +411,10 @@ mod app {
             .await
             .is_err()
         {
-            log_fmt(
+            emit_line(
                 &mut cx.shared.serial,
-                format_args!("baro: invalid ODR/OSR (too fast for oversampling)\r\n"),
+                wire::Level::Error,
+                format_args!("baro: invalid ODR/OSR (too fast for oversampling)"),
             );
             return;
         }
@@ -423,10 +429,7 @@ mod app {
             cx.shared.latest.lock(|st| st.set_pressure(s.pressure_hpa));
 
             if n % config::BARO_LOG_DIV == 0 {
-                log_fmt(
-                    &mut cx.shared.serial,
-                    format_args!("baro press={:.2}hPa temp={:.2}C\r\n", s.pressure_hpa, s.temp_c),
-                );
+                log_baro(&mut cx.shared.serial, &s);
             }
 
             Mono::delay(period).await;
@@ -440,22 +443,24 @@ mod app {
         let mag = cx.local.mag;
 
         let id = mag.who_am_i();
-        let ok = if id == crate::mag::EXPECTED_WHO_AM_I { "ok" } else { "MISMATCH" };
-        log_fmt(
+        let matched = id == crate::mag::EXPECTED_WHO_AM_I;
+        emit_line(
             &mut cx.shared.serial,
+            if matched { wire::Level::Info } else { wire::Level::Warn },
             format_args!(
-                "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}\r\n",
+                "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}",
                 id,
                 crate::mag::EXPECTED_WHO_AM_I,
-                ok
+                if matched { "ok" } else { "MISMATCH" }
             ),
         );
 
         // Reset and enter continuous mode (driver owns the reset-wait + continuous-latch retries).
         if !mag.bring_up(config::MAG_ODR, |ms| Mono::delay(ms.millis())).await {
-            log_fmt(
+            emit_line(
                 &mut cx.shared.serial,
-                format_args!("mag: failed to enter continuous mode\r\n"),
+                wire::Level::Error,
+                format_args!("mag: failed to enter continuous mode"),
             );
         }
 
@@ -470,8 +475,9 @@ mod app {
             cx.shared.latest.lock(|state| state.set_mag(s));
 
             if n % config::MAG_LOG_DIV == 0 {
-                if diag_enabled() {
-                    // Verbose, read-only: chip ID, the three config registers, and STATUS.
+                // Text + diag: verbose register dump (reads live config regs, so it stays here).
+                // Otherwise (binary, or text without diag) render the sample via the helper.
+                if !output_is_binary() && diag_enabled() {
                     let id = mag.who_am_i();
                     let (ca, cb, cc) = mag.read_cfg();
                     log_fmt(
@@ -482,13 +488,7 @@ mod app {
                         ),
                     );
                 } else {
-                    log_fmt(
-                        &mut cx.shared.serial,
-                        format_args!(
-                            "mag field[uT]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
-                            s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c
-                        ),
-                    );
+                    log_mag(&mut cx.shared.serial, &s);
                 }
             }
 
@@ -529,11 +529,12 @@ mod app {
 
                 *cx.local.n = cx.local.n.wrapping_add(1);
                 if *cx.local.n % config::FUSION_LOG_DIV == 0 {
-                    if diag_enabled() {
-                        // Verbose vertical-channel dump for characterizing the baro disturbance
-                        // (e.g. props-on): `resid` is the baro innovation that an adaptive-trust
-                        // scheme would gate on (sizes `r0`); `vacc` shows accel/vibration coupling;
-                        // `bias` the estimated accel bias (a drift here inflates `resid`).
+                    // Text + diag: verbose vertical-channel dump for characterizing the baro
+                    // disturbance (e.g. props-on) — `resid` is the baro innovation an adaptive-trust
+                    // scheme would gate on (sizes `r0`); `vacc` shows accel/vibration coupling;
+                    // `bias` the estimated accel bias (a drift here inflates `resid`). Reads
+                    // estimator internals, so it stays here. Otherwise render via the helper.
+                    if !output_is_binary() && diag_enabled() {
                         log_fmt(
                             &mut cx.shared.serial,
                             format_args!(
@@ -549,17 +550,7 @@ mod app {
                             ),
                         );
                     } else {
-                        log_fmt(
-                            &mut cx.shared.serial,
-                            format_args!(
-                                "fus roll={:.1} pitch={:.1} yaw={:.1}deg alt={:.2}m vz={:.2}m/s\r\n",
-                                state.roll_deg,
-                                state.pitch_deg,
-                                state.yaw_deg,
-                                state.altitude_m,
-                                state.vertical_velocity
-                            ),
-                        );
+                        log_fused(&mut cx.shared.serial, &state);
                     }
                 }
             }

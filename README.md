@@ -67,12 +67,16 @@ The transport, dev loop, all three onboard sensors, and sensor fusion are up.
   (PID/mixer/motors) is an explicit non-goal (see [Scope & non-goals](#scope--non-goals)).
 - Streams a `tick` counter line once per second and cycles the status LEDs red → green → blue
   (one per tick) as a heartbeat.
+- **Telemetry output, text or binary** (`src/telemetry.rs`): boots emitting human-readable text
+  lines; sending `b` over the serial link switches to **binary** postcard + COBS frames
+  ([`discovery-telemetry`](https://github.com/wboayue/discovery-telemetry) wire format, decoded
+  losslessly by the host scope), `t` switches back. Status/event lines (mode acks, sensor
+  bring-up, errors) ride a `Status` frame in binary. Reverts to text when the host closes the port.
 - Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing; `d`
   toggles verbose per-sensor diagnostics (register dumps) at runtime.
-- **Roadmap:** richer on-wire telemetry framing
-  ([`discovery-telemetry`](https://github.com/wboayue/discovery-telemetry)) and the
-  `discovery-scope` host viewer (the visualization half of the series). Control loops / actuation
-  are explicit non-goals (see [Scope & non-goals](#scope--non-goals)).
+- **Roadmap:** the `discovery-scope` host viewer (the visualization half of the series) consuming
+  the binary stream. Control loops / actuation are explicit non-goals (see
+  [Scope & non-goals](#scope--non-goals)).
 
 ## Hardware
 
@@ -176,6 +180,9 @@ per-sensor quirks, fusion axis/dt gotchas).
 | `src/baro.rs`            | BMP388/BMP390 barometer driver (I2C2)             |
 | `src/mag.rs`             | IIS2MDC/LIS2MDL magnetometer driver (I2C4)        |
 | `src/fusion.rs`          | Sensor fusion: attitude (fusion-ahrs) + altitude (fusion-altitude) |
+| `src/telemetry.rs`       | Serial output layer: text logging + binary (`discovery-telemetry`) framing, `b`/`t`/`d` mode flags |
+| `src/config.rs`          | Tunable sensor/loop rates, fusion gains, output-mode default |
+| `build.rs`               | Injects the short git commit (`GIT_HASH`) for the telemetry `Hello` frame |
 | `memory.x`               | Linker regions: FLASH @ `0x08000000`, RAM @ `0x20000000` |
 | `.cargo/config.toml`     | Target + linker args                             |
 | `docs/ark-fpv-board.md`  | ARK FPV pin map                                  |
@@ -215,6 +222,10 @@ Datasheets and reference drivers the sensor code is built from. Local PDF copies
   observer for altitude + vertical velocity). The pressure→altitude step in `src/fusion.rs` uses the
   ISA/NOAA hypsometric formula `44330 * (1 - (p/p0)^(1/5.255))` (constants per the Bosch BMP3
   examples).
+- **Telemetry wire format** — [`discovery-telemetry`](https://github.com/wboayue/discovery-telemetry)
+  (`no_std`, postcard + COBS): the single source of truth for the binary `Frame`/`Msg` types both
+  this firmware and `discovery-scope` compile. `src/telemetry.rs` emits them; `PROTOCOL_VERSION`
+  is negotiated in the `Hello` frame.
 
 ## License
 

@@ -66,6 +66,12 @@ pub const ALT_POSITION_GAIN: f32 = 2.40;
 pub const ALT_VELOCITY_GAIN: f32 = 2.88;
 pub const ALT_BIAS_GAIN: f32 = 0.675;
 
+// --- Telemetry output --------------------------------------------------------
+// Output mode at boot: false = human-readable text lines (a terminal user sees readable output
+// with zero setup); true = binary postcard+COBS frames. The host scope switches to binary at
+// runtime by sending 'b' ('t' switches back); see CLAUDE.md "Telemetry output".
+pub const DEFAULT_OUTPUT_BINARY: bool = false;
+
 // Reference sea-level pressure for the barometric formula (hPa). ISA standard. Altitude is
 // absolute ISA height relative to this P0 (not re-zeroed at startup — the estimator is *seeded* to
 // the first baro altitude so it starts converged). Set a local QNH here for true MSL altitude.
