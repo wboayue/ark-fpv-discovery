@@ -1,7 +1,15 @@
 [package]
 name = "ark-discovery"
 version = "0.1.0"
+authors = ["Wil Boayue <wil@wsbsolutions.com>"]
 license = "MIT"
+description = "Bare-metal Rust (RTIC) firmware for the ARK FPV (STM32H743) flight controller — IMU/baro/mag bring-up and sensor fusion (attitude & altitude). Sensing and estimation, not a full flight stack."
+repository = "https://github.com/wboayue/ark-fpv-discovery"
+readme = "README.md"
+keywords = ["embedded", "rtic", "stm32", "flight-controller", "sensor-fusion"]
+categories = ["embedded", "no-std", "aerospace::drones", "hardware-support"]
+# Board-specific firmware binary, not a library — not meant for crates.io.
+publish = false
 # edition 2024 to match the fusion-ahrs / fusion-altitude crates (both edition 2024, rustc >= 1.85).
 edition = "2024"
 
