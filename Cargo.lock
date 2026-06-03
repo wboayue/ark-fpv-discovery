@@ -127,6 +127,7 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 [[package]]
 name = "discovery-telemetry"
 version = "0.2.0"
+source = "git+https://github.com/wboayue/discovery-telemetry?tag=v0.2.0#d6a11cc3058501e35f18d8f153289b0dfbe90f88"
 dependencies = [
  "postcard",
  "serde",
