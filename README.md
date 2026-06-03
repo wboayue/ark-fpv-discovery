@@ -1,8 +1,10 @@
 # ark-discovery
 
-A discovery project for **reading and processing sensor data** from the
-[ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller (STM32H743, Cortex-M7) —
-bare-metal (`#![no_std]`) Rust firmware on the [RTIC 2](https://rtic.rs) async framework.
+`ark-discovery` is the firmware crate of the **discovery-\*** series — a platform for exploring
+embedded flight control: **sensors, fusion, and host visualization**. It **reads and processes
+sensor data** from the [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller
+(STM32H743, Cortex-M7) — bare-metal (`#![no_std]`) Rust firmware on the [RTIC 2](https://rtic.rs)
+async framework — and streams it out over USB for host tools to consume.
 
 The aim is to bring up each onboard sensor in turn, stream its readings out over USB, and fuse
 them into attitude and altitude estimates. The board carries:
@@ -14,6 +16,21 @@ them into attitude and altitude estimates. The board carries:
 | Magnetometer | IIS2MDC / LIS2MDL | I2C4 @ `0x1E` |
 
 Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
+
+## Scope & non-goals
+
+The discovery-\* series is deliberately **not a full flight stack**. It explores the *sensing,
+estimation, and visualization* half of flight control and stops there by design:
+
+- **No control loops** — no PID / rate / attitude controllers.
+- **No actuation** — no motor mixing, no ESC/servo outputs.
+- **No ground-control protocol** — no MAVLink-style GCS link.
+
+The fused attitude/altitude estimate is the **endpoint** here, not a step toward actuation. Sibling
+crates in the series cover the rest of the exploration: a host telemetry viewer (`discovery-scope`,
+planned) and [`discovery-telemetry`](https://github.com/wboayue/discovery-telemetry), the telemetry
+wire format that ties firmware to host tools (see that crate's own non-goals). This crate is the
+firmware end of that link.
 
 ## Current state
 
@@ -40,18 +57,22 @@ The transport, dev loop, all three onboard sensors, and sensor fusion are up.
   the mean each tick (**delta-angle downsampling** — full gyro fidelity, estimator decoupled, heavy
   math off the interrupt path). 9-DOF (mag for absolute yaw) or 6-DOF, toggled in `config`. Logs a
   `fus roll=… pitch=… yaw=…deg alt=…m vz=…m/s` line and keeps the latest estimate in a shared
-  resource for a future control loop. Altitude is absolute ISA height (relative to a fixed P0),
+  resource (the estimation endpoint — a control law that consumes it is out of scope; see
+  [Scope & non-goals](#scope--non-goals)). Altitude is absolute ISA height (relative to a fixed P0),
   seeded at startup so it starts converged; vertical velocity is the meaningful relative signal.
 - **Rates are configurable in [`src/config.rs`](src/config.rs)** — IMU ODR / log rate, baro ODR /
-  oversampling / sample rate / log rate, mag ODR / sample rate / log rate. Sized for quad/VTOL
-  control: the rate loop wants ≥400 Hz
-  (gyro sampled ≥1 kHz, anti-aliased), the baro only ~25 Hz. The control *law* (PID/mixer/motors)
-  is not implemented yet — this provides the timely data path it will run on.
+  oversampling / sample rate / log rate, mag ODR / sample rate / log rate. Sized to be
+  representative of quad/VTOL control rates (rate loop ≥400 Hz, gyro sampled ≥1 kHz and
+  anti-aliased, baro only ~25 Hz) so the data path is realistic — the control *law* itself
+  (PID/mixer/motors) is an explicit non-goal (see [Scope & non-goals](#scope--non-goals)).
 - Streams a `tick` counter line once per second and cycles the status LEDs red → green → blue
   (one per tick) as a heartbeat.
 - Sending `r` over the serial link reboots into the ROM bootloader for DFU reflashing; `d`
   toggles verbose per-sensor diagnostics (register dumps) at runtime.
-- **Roadmap:** the control law (PID/mixer/motor outputs) on top of the fused estimate.
+- **Roadmap:** richer on-wire telemetry framing
+  ([`discovery-telemetry`](https://github.com/wboayue/discovery-telemetry)) and the
+  `discovery-scope` host viewer (the visualization half of the series). Control loops / actuation
+  are explicit non-goals (see [Scope & non-goals](#scope--non-goals)).
 
 ## Hardware
 
