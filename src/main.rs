@@ -283,6 +283,12 @@ mod app {
                         // so the scope confirms the switch and checks the protocol version.
                         if rx.contains(&b'b') {
                             set_output_binary(true);
+                            // Flush the partial text line still sitting (delimiter-less) in the
+                            // host's COBS accumulator: a lone 0x00 closes it as one discarded
+                            // frame so the Hello below lands clean. Without this the Hello is
+                            // concatenated onto that text and dropped on resync — the host never
+                            // sees the version handshake. (Found on hardware.)
+                            let _ = serial.write(&[0x00]);
                             write_frame(
                                 serial,
                                 wire::Msg::Hello(wire::Hello {
