@@ -1,7 +1,7 @@
 [package]
 name = "ark-discovery"
 version = "0.1.0"
-authors = ["Wil Boayue <wil@wsbsolutions.com>"]
+authors = ["Wil Boayue <wil@wsblabs.com>"]
 license = "MIT"
 description = "Bare-metal Rust (RTIC) firmware for the ARK FPV (STM32H743) flight controller — IMU/baro/mag bring-up and sensor fusion (attitude & altitude). Sensing and estimation, not a full flight stack."
 repository = "https://github.com/wboayue/ark-fpv-discovery"
