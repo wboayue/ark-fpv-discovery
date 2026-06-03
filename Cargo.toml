@@ -1,6 +1,6 @@
 [package]
-name = "ark-discovery"
-version = "0.1.0"
+name = "ark-fpv-discovery"
+version = "0.2.0"
 authors = ["Wil Boayue <wil@wsblabs.com>"]
 license = "MIT"
 description = "Bare-metal Rust (RTIC) firmware for the ARK FPV (STM32H743) flight controller — IMU/baro/mag bring-up and sensor fusion (attitude & altitude). Sensing and estimation, not a full flight stack."
@@ -33,7 +33,7 @@ heapless = "0.8"
 
 # Shared firmware<->host telemetry wire format (postcard + COBS frames). We only call its
 # codec::encode (which wraps postcard), so no direct postcard/serde dep is needed here.
-discovery-telemetry = { git = "https://github.com/wboayue/discovery-telemetry", tag = "v0.2.0" }
+discovery-telemetry = "0.2.0"
 
 # Sensor fusion. fusion-ahrs needs nalgebra (no_std via libm); declare nalgebra directly, pinned to
 # the same version/features so Cargo unifies to one copy. libm provides powf for the baro→altitude

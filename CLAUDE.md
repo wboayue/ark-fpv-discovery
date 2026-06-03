@@ -20,6 +20,7 @@ Do feature work on a new branch off `main` — never commit directly to `main`. 
 
 - **`README.md`** — keep the sensor table, "Current state" bullets, roadmap, `## Layout`, and `## References` in sync. New sensor/library → add a row, a state bullet, and a References entry; finished roadmap item → move it from roadmap to current state.
 - **`CLAUDE.md`** — add/extend the relevant `## Sensors — …` or subsystem section with the register/protocol facts and **what bit us** (the "plausible but frozen", interrupt-storm, axis-mismatch class of notes is the highest-value content here). Correct any statement a hardware result proves wrong, rather than layering a caveat on top.
+- **`CHANGELOG.md`** — follow [Keep a Changelog](https://keepachangelog.com); versions follow [SemVer](https://semver.org). Every user- or contributor-visible change adds a bullet under an `## [Unreleased]` heading at the top, in the right group (`Added`/`Changed`/`Fixed`/`Removed`). On release, rename `[Unreleased]` to the version with the date and start a fresh empty `[Unreleased]` (see `## Releasing`).
 
 A quick heuristic: if a reviewer reading only the diff would be surprised the docs weren't touched, touch them.
 
@@ -83,7 +84,7 @@ There are no tests — `#![no_std]` firmware has no host test harness. The verif
 
 Tagged releases ship a prebuilt `firmware.bin` as a GitHub release asset so a flasher needn't have the Rust toolchain. `firmware.bin` is git-ignored (`*.bin`) — the **release asset is the canonical binary** for a tag; it is *not* reproducible from a plain checkout without rebuilding. Steps (run on `main`, clean tree, at the commit you want to ship):
 
-1. **Bump `version`** in `Cargo.toml` to match the tag (`cargo build` to refresh `Cargo.lock`), commit via PR.
+1. **Bump `version`** in `Cargo.toml` to match the tag (`cargo build` to refresh `Cargo.lock`), commit via PR. In the same PR, **roll `CHANGELOG.md`**: rename the `## [Unreleased]` heading to `## [x.y.z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]` above it.
 2. **Build the release binary** from that exact commit — the same `objcopy` the flash flow uses:
    ```bash
    cargo objcopy --release -- -O binary firmware.bin
