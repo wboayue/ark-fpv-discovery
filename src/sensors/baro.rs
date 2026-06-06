@@ -14,6 +14,7 @@ use core::future::Future;
 
 use stm32h7xx_hal as hal;
 
+use super::{BaroOdr, BaroSample, ConfigError, Oversampling};
 use crate::i2c_regs::I2cRegs;
 
 type I2c2 = hal::i2c::I2c<hal::pac::I2C2>;
@@ -47,72 +48,29 @@ const SETTLE_TEMP_US: u32 = 313;
 const ADC_CONV_US: u32 = 2000;
 const MEAS_BASE_US: u32 = 234;
 
-/// Output data rate (`ODR` register `0x1D`). Coupled to oversampling by the timing rule above.
-#[derive(Clone, Copy)]
-pub enum BaroOdr {
-    Hz200,
-    Hz100,
-    Hz50,
-    Hz25,
-    Hz12_5,
-}
-
-impl BaroOdr {
-    const fn reg(self) -> u8 {
-        match self {
-            BaroOdr::Hz200 => 0x00,
-            BaroOdr::Hz100 => 0x01,
-            BaroOdr::Hz50 => 0x02,
-            BaroOdr::Hz25 => 0x03,
-            BaroOdr::Hz12_5 => 0x04,
-        }
-    }
-
-    const fn period_us(self) -> u32 {
-        match self {
-            BaroOdr::Hz200 => 5_000,
-            BaroOdr::Hz100 => 10_000,
-            BaroOdr::Hz50 => 20_000,
-            BaroOdr::Hz25 => 40_000,
-            BaroOdr::Hz12_5 => 80_000,
-        }
+/// Map the logical [`BaroOdr`] to the ODR register (`0x1D`) code. Values per the Bosch BMP3
+/// datasheet (`bmp3_defs.h` `BMP3_ODR_*`).
+const fn odr_reg(odr: BaroOdr) -> u8 {
+    match odr {
+        BaroOdr::Hz200 => 0x00,
+        BaroOdr::Hz100 => 0x01,
+        BaroOdr::Hz50 => 0x02,
+        BaroOdr::Hz25 => 0x03,
+        BaroOdr::Hz12_5 => 0x04,
     }
 }
 
-/// Oversampling factor (`OSR` register fields). Value is the register code; `factor = 1 << code`.
-#[derive(Clone, Copy)]
-pub enum Oversampling {
-    X1,
-    X2,
-    X4,
-    X8,
-    X16,
-    X32,
-}
-
-impl Oversampling {
-    const fn reg(self) -> u8 {
-        match self {
-            Oversampling::X1 => 0,
-            Oversampling::X2 => 1,
-            Oversampling::X4 => 2,
-            Oversampling::X8 => 3,
-            Oversampling::X16 => 4,
-            Oversampling::X32 => 5,
-        }
+/// Map the logical [`Oversampling`] to its OSR register field code (`log2(factor)`, 0..=5). Values
+/// per the Bosch BMP3 datasheet (`bmp3_defs.h` `BMP3_OVERSAMPLING_*`).
+const fn osr_reg(osr: Oversampling) -> u8 {
+    match osr {
+        Oversampling::X1 => 0,
+        Oversampling::X2 => 1,
+        Oversampling::X4 => 2,
+        Oversampling::X8 => 3,
+        Oversampling::X16 => 4,
+        Oversampling::X32 => 5,
     }
-}
-
-/// `configure` rejects an ODR too fast for the chosen oversampling (Bosch timing rule).
-#[derive(Debug)]
-pub enum ConfigError {
-    OdrTooFast,
-}
-
-/// One compensated sample.
-pub struct BaroSample {
-    pub pressure_hpa: f32,
-    pub temp_c: f32,
 }
 
 /// Float-scaled calibration coefficients, per Bosch `parse_calib_data` (quantized form).
@@ -217,13 +175,13 @@ impl Baro {
         osr_t: Oversampling,
     ) -> Result<(), ConfigError> {
         let meas_us = MEAS_BASE_US
-            + (SETTLE_PRESS_US + (1 << osr_p.reg()) * ADC_CONV_US)
-            + (SETTLE_TEMP_US + (1 << osr_t.reg()) * ADC_CONV_US);
+            + (SETTLE_PRESS_US + osr_p.factor() * ADC_CONV_US)
+            + (SETTLE_TEMP_US + osr_t.factor() * ADC_CONV_US);
         if meas_us >= odr.period_us() {
             return Err(ConfigError::OdrTooFast);
         }
-        self.write_reg(REG_OSR, (osr_t.reg() << 3) | osr_p.reg());
-        self.write_reg(REG_ODR, odr.reg());
+        self.write_reg(REG_OSR, (osr_reg(osr_t) << 3) | osr_reg(osr_p));
+        self.write_reg(REG_ODR, odr_reg(odr));
         self.write_reg(REG_PWR_CTRL, PWR_CTRL_NORMAL);
         Ok(())
     }

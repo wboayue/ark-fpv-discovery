@@ -190,7 +190,7 @@ per-sensor quirks, fusion axis/dt gotchas).
 | Path                     | What                                             |
 | ------------------------ | ------------------------------------------------ |
 | `src/main.rs`            | The `#[rtic::app]` module — init, tasks, peripheral wiring |
-| `src/sensors.rs`         | Facade re-exporting the three sensor drivers      |
+| `src/sensors.rs`         | Sensor role layer: contract types + role traits (`Imu`/`Baro`/`Mag`); re-exports the drivers |
 | `src/sensors/imu.rs`     | IIM-42653 IMU driver (SPI1)                       |
 | `src/sensors/baro.rs`    | BMP388/BMP390 barometer driver (I2C2)             |
 | `src/sensors/mag.rs`     | IIS2MDC/LIS2MDL magnetometer driver (I2C4)        |

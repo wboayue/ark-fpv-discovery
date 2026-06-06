@@ -77,7 +77,8 @@ mod app {
     use super::*;
     use crate::sensors::baro::{Baro, CHIP_ID_BMP388, CHIP_ID_BMP390};
     use crate::fusion::{FusedState, Fusion, SensorState};
-    use crate::sensors::imu::{Imu, ImuSample};
+    use crate::sensors::ImuSample;
+    use crate::sensors::imu::Imu;
     use crate::sensors::mag::Mag;
     use discovery_telemetry as wire;
     // Serial output layer: text logging, binary framing, and the output-mode / diagnostic flags.

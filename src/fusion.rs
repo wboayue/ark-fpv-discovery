@@ -22,8 +22,7 @@ use fusion_ahrs::{Ahrs, AhrsSettings, Convention};
 use fusion_altitude::{AltitudeEstimator, AltitudeSettings, GRAVITY};
 
 use crate::config;
-use crate::sensors::imu::ImuSample;
-use crate::sensors::mag::MagSample;
+use crate::sensors::{ImuSample, MagSample};
 
 /// Fused estimate. Flat and `Copy` so it drops straight into a `#[shared]` resource and the
 /// logger. Angles in degrees, altitude in metres, velocity in m/s.

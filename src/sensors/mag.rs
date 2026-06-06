@@ -15,6 +15,7 @@ use core::future::Future;
 
 use stm32h7xx_hal as hal;
 
+use super::{MagOdr, MagSample};
 use crate::i2c_regs::I2cRegs;
 
 type I2c4 = hal::i2c::I2c<hal::pac::I2C4>;
@@ -57,32 +58,15 @@ const MAG_UT_PER_LSB: f32 = 0.15;
 const TEMP_LSB_PER_C: f32 = 8.0;
 const TEMP_REF_C: f32 = 25.0;
 
-/// Output data rate (CFG_REG_A bits[3:2]). Low-bandwidth sensor; poll at or below this rate.
-#[derive(Clone, Copy)]
-pub enum MagOdr {
-    Hz10,
-    Hz20,
-    Hz50,
-    Hz100,
-}
-
-impl MagOdr {
-    const fn reg(self) -> u8 {
-        // bits[3:2]
-        match self {
-            MagOdr::Hz10 => 0b00 << 2,
-            MagOdr::Hz20 => 0b01 << 2,
-            MagOdr::Hz50 => 0b10 << 2,
-            MagOdr::Hz100 => 0b11 << 2,
-        }
+/// Map the logical [`MagOdr`] to the CFG_REG_A ODR field (bits[3:2]). Values per the ST
+/// `lis2mdl_reg.h` `lis2mdl_odr_t`.
+const fn odr_reg(odr: MagOdr) -> u8 {
+    match odr {
+        MagOdr::Hz10 => 0b00 << 2,
+        MagOdr::Hz20 => 0b01 << 2,
+        MagOdr::Hz50 => 0b10 << 2,
+        MagOdr::Hz100 => 0b11 << 2,
     }
-}
-
-/// One scaled sample.
-#[derive(Clone, Copy)]
-pub struct MagSample {
-    pub field_ut: [f32; 3],
-    pub temp_c: f32,
 }
 
 pub struct Mag {
@@ -168,7 +152,7 @@ impl Mag {
     /// Write CFG_REG_A = temperature-compensation + ODR + continuous mode. Idempotent; safe to
     /// call repeatedly to re-assert continuous mode until it latches (see [`configure`]).
     pub fn start_continuous(&mut self, odr: MagOdr) {
-        self.write_reg(REG_CFG_A, CFG_A_COMP_TEMP_EN | odr.reg() | MD_CONTINUOUS);
+        self.write_reg(REG_CFG_A, CFG_A_COMP_TEMP_EN | odr_reg(odr) | MD_CONTINUOUS);
     }
 
     /// True once CFG_REG_A reports continuous mode (MD bits == 0) — i.e. conversions are running.

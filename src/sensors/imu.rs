@@ -21,6 +21,8 @@ use stm32h7xx_hal::{
     prelude::*,
 };
 
+use super::{ImuOdr, ImuSample};
+
 type Spi1 = hal::spi::Spi<hal::pac::SPI1, hal::spi::Enabled>;
 
 // --- Bank-0 registers ---------------------------------------------------------
@@ -52,39 +54,14 @@ const GYRO_LSB_PER_DPS: f32 = 16.384; // ±2000 dps
 
 const READ: u8 = 0x80; // OR into the address byte for a read transaction
 
-/// Output data rate (gyro/accel). The DRDY interrupt fires at this rate, so it sets the
-/// control-loop cadence. Field value goes in ACCEL_CONFIG0/GYRO_CONFIG0 bits[3:0].
-#[derive(Clone, Copy)]
-pub enum ImuOdr {
-    Hz200,
-    Hz500,
-    Hz1000,
-}
-
-impl ImuOdr {
-    const fn reg(self) -> u8 {
-        match self {
-            ImuOdr::Hz200 => 0x07,
-            ImuOdr::Hz500 => 0x0F,
-            ImuOdr::Hz1000 => 0x06,
-        }
+/// Map the logical [`ImuOdr`] to the ACCEL_CONFIG0/GYRO_CONFIG0 ODR field (bits[3:0]).
+/// Values per the IIM-42653 datasheet (cross-checked vs PX4 `InvenSense_ICM42688P_registers.hpp`).
+const fn odr_reg(odr: ImuOdr) -> u8 {
+    match odr {
+        ImuOdr::Hz200 => 0x07,
+        ImuOdr::Hz500 => 0x0F,
+        ImuOdr::Hz1000 => 0x06,
     }
-
-    pub const fn hz(self) -> u32 {
-        match self {
-            ImuOdr::Hz200 => 200,
-            ImuOdr::Hz500 => 500,
-            ImuOdr::Hz1000 => 1000,
-        }
-    }
-}
-
-/// One scaled sample.
-#[derive(Clone, Copy)]
-pub struct ImuSample {
-    pub accel_g: [f32; 3],
-    pub gyro_dps: [f32; 3],
-    pub temp_c: f32,
 }
 
 pub struct Imu {
@@ -137,7 +114,7 @@ impl Imu {
     /// The DRDY interrupt then fires on INT1 at `odr` once the gyro has started (~50 ms).
     pub fn configure_control_mode(&mut self, odr: ImuOdr) {
         self.write_reg(REG_BANK_SEL, 0x00); // ensure bank 0
-        let cfg = FS_SEL | odr.reg();
+        let cfg = FS_SEL | odr_reg(odr);
         self.write_reg(ACCEL_CONFIG0, cfg);
         self.write_reg(GYRO_CONFIG0, cfg);
         self.write_reg(GYRO_ACCEL_CONFIG0, UI_FILT_BW_ODR_4); // AAF stays enabled (default)

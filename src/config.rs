@@ -1,8 +1,6 @@
 //! Single place to tune sensor/control-loop rates. See CLAUDE.md "Control-loop data path".
 
-use crate::sensors::baro::{BaroOdr, Oversampling};
-use crate::sensors::imu::ImuOdr;
-use crate::sensors::mag::MagOdr;
+use crate::sensors::{BaroOdr, ImuOdr, MagOdr, Oversampling};
 
 // --- IMU ---------------------------------------------------------------------
 // The IMU loop is gyro-synchronous: its data-ready interrupt fires at IMU_ODR, so IMU_ODR *is*
