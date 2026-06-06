@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Sensor drivers grouped under a `sensors` module: `src/{imu,baro,mag}.rs` moved to `src/sensors/` behind a `src/sensors.rs` facade (no driver logic changed).
+
 ## [0.3.0] - 2026-06-03
 
 ### Added
