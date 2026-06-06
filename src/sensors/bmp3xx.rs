@@ -14,7 +14,7 @@ use core::future::Future;
 
 use stm32h7xx_hal as hal;
 
-use super::{BaroOdr, BaroSample, ConfigError, Oversampling};
+use super::{Baro, BaroOdr, BaroSample, ConfigError, Identify, Oversampling, SoftReset};
 use crate::i2c_regs::I2cRegs;
 
 type I2c2 = hal::i2c::I2c<hal::pac::I2C2>;
@@ -92,12 +92,12 @@ struct Calib {
     p11: f64,
 }
 
-pub struct Baro {
+pub struct Bmp3xx {
     regs: I2cRegs<I2c2>,
     calib: Calib,
 }
 
-impl Baro {
+impl Bmp3xx {
     /// Take ownership of the configured I2C2 bus. Calibration is zeroed until
     /// [`read_calibration`](Self::read_calibration) runs.
     pub fn new(i2c: I2c2) -> Self {
@@ -113,15 +113,6 @@ impl Baro {
 
     fn write_reg(&mut self, reg: u8, val: u8) {
         self.regs.write_reg(reg, val);
-    }
-
-    pub fn chip_id(&mut self) -> u8 {
-        self.regs.read_reg(REG_CHIP_ID)
-    }
-
-    /// Soft-reset to a known state. Caller must wait ~2 ms afterwards.
-    pub fn soft_reset(&mut self) {
-        self.write_reg(REG_CMD, CMD_SOFT_RESET);
     }
 
     /// Read the 21-byte NVM trimming block and scale it to floating-point coefficients.
@@ -185,12 +176,31 @@ impl Baro {
         self.write_reg(REG_PWR_CTRL, PWR_CTRL_NORMAL);
         Ok(())
     }
+}
 
+impl Identify for Bmp3xx {
+    fn read_id(&mut self) -> u8 {
+        self.regs.read_reg(REG_CHIP_ID)
+    }
+
+    fn id_matches(id: u8) -> bool {
+        id == CHIP_ID_BMP388 || id == CHIP_ID_BMP390
+    }
+}
+
+impl SoftReset for Bmp3xx {
+    /// Soft-reset to a known state. Caller must wait ~2 ms afterwards.
+    fn soft_reset(&mut self) {
+        self.write_reg(REG_CMD, CMD_SOFT_RESET);
+    }
+}
+
+impl Baro for Bmp3xx {
     /// Full polled bring-up: soft-reset, settle, load factory calibration, start normal-mode
     /// sampling, then wait for the first conversion. Encapsulates the reset/settle timing so the
     /// caller only supplies an async millisecond delay (e.g. `|ms| Mono::delay(ms.millis())`).
     /// Returns `Err(OdrTooFast)` straight from [`configure`](Self::configure).
-    pub async fn bring_up<F, Fut>(
+    async fn bring_up<F, Fut>(
         &mut self,
         odr: BaroOdr,
         osr_p: Oversampling,
@@ -210,7 +220,7 @@ impl Baro {
     }
 
     /// Read the latest sample and apply Bosch float compensation.
-    pub fn read(&mut self) -> BaroSample {
+    fn read(&mut self) -> BaroSample {
         let mut b = [0u8; 6];
         self.read_regs(REG_DATA, &mut b);
         // 24-bit, little-endian: XLSB, LSB, MSB.

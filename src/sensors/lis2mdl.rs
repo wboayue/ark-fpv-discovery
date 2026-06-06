@@ -15,7 +15,7 @@ use core::future::Future;
 
 use stm32h7xx_hal as hal;
 
-use super::{MagOdr, MagSample};
+use super::{Identify, Mag, MagOdr, MagSample, SoftReset};
 use crate::i2c_regs::I2cRegs;
 
 type I2c4 = hal::i2c::I2c<hal::pac::I2C4>;
@@ -69,11 +69,11 @@ const fn odr_reg(odr: MagOdr) -> u8 {
     }
 }
 
-pub struct Mag {
+pub struct Lis2mdl {
     regs: I2cRegs<I2c4>,
 }
 
-impl Mag {
+impl Lis2mdl {
     /// Take ownership of the configured I2C4 bus.
     pub fn new(i2c: I2c4) -> Self {
         Self {
@@ -87,19 +87,6 @@ impl Mag {
 
     fn write_reg(&mut self, reg: u8, val: u8) {
         self.regs.write_reg(reg, val);
-    }
-
-    pub fn who_am_i(&mut self) -> u8 {
-        self.regs.read_reg(REG_WHO_AM_I)
-    }
-
-    /// Soft-reset the config registers. SOFT_RST self-clears when the reset completes; the caller
-    /// MUST poll [`reset_complete`](Self::reset_complete) until true before configuring. A fixed
-    /// delay is not enough: if `configure` writes CFG_A before the reset finalizes, the reset then
-    /// clobbers the freshly-written MD (mode) bits back to the idle default — the chip ends up in
-    /// idle (no conversions, frozen data) even though COMP_TEMP_EN/ODR appear set.
-    pub fn soft_reset(&mut self) {
-        self.write_reg(REG_CFG_A, CFG_A_SOFT_RST);
     }
 
     /// True once the soft reset has finished (CFG_A SOFT_RST bit self-cleared).
@@ -118,35 +105,6 @@ impl Mag {
         self.write_reg(REG_CFG_C, CFG_C_BDU);
         self.write_reg(REG_CFG_B, CFG_B_VAL);
         self.start_continuous(odr);
-    }
-
-    /// Full polled bring-up: soft-reset, wait for it to self-clear, configure, then re-assert
-    /// continuous mode until it latches. Owns the two chip quirks the task shouldn't know about —
-    /// the reset must finalize before configuring, and the first continuous write after reset
-    /// often reverts MD to idle (see [`soft_reset`](Self::soft_reset) / [`configure`]). The caller
-    /// supplies an async millisecond delay (e.g. `|ms| Mono::delay(ms.millis())`). Returns `true`
-    /// once continuous conversion is confirmed running, `false` if it never latched.
-    pub async fn bring_up<F, Fut>(&mut self, odr: MagOdr, mut delay_ms: F) -> bool
-    where
-        F: FnMut(u32) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.soft_reset();
-        for _ in 0..10 {
-            delay_ms(2).await;
-            if self.reset_complete() {
-                break;
-            }
-        }
-        self.configure(odr);
-        for _ in 0..10 {
-            delay_ms(10).await;
-            if self.is_continuous() {
-                return true;
-            }
-            self.start_continuous(odr);
-        }
-        false
     }
 
     /// Write CFG_REG_A = temperature-compensation + ODR + continuous mode. Idempotent; safe to
@@ -177,8 +135,61 @@ impl Mag {
         (b[0], b[1], b[2])
     }
 
+}
+
+impl Identify for Lis2mdl {
+    fn read_id(&mut self) -> u8 {
+        self.regs.read_reg(REG_WHO_AM_I)
+    }
+
+    fn id_matches(id: u8) -> bool {
+        id == EXPECTED_WHO_AM_I
+    }
+}
+
+impl SoftReset for Lis2mdl {
+    /// Soft-reset the config registers. SOFT_RST self-clears when the reset completes; the caller
+    /// MUST poll [`reset_complete`](Self::reset_complete) until true before configuring. A fixed
+    /// delay is not enough: if `configure` writes CFG_A before the reset finalizes, the reset then
+    /// clobbers the freshly-written MD (mode) bits back to the idle default — the chip ends up in
+    /// idle (no conversions, frozen data) even though COMP_TEMP_EN/ODR appear set.
+    fn soft_reset(&mut self) {
+        self.write_reg(REG_CFG_A, CFG_A_SOFT_RST);
+    }
+}
+
+impl Mag for Lis2mdl {
+    /// Full polled bring-up: soft-reset, wait for it to self-clear, configure, then re-assert
+    /// continuous mode until it latches. Owns the two chip quirks the task shouldn't know about —
+    /// the reset must finalize before configuring, and the first continuous write after reset
+    /// often reverts MD to idle (see [`SoftReset::soft_reset`] / [`Self::configure`]). The caller
+    /// supplies an async millisecond delay (e.g. `|ms| Mono::delay(ms.millis())`). Returns `true`
+    /// once continuous conversion is confirmed running, `false` if it never latched.
+    async fn bring_up<F, Fut>(&mut self, odr: MagOdr, mut delay_ms: F) -> bool
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.soft_reset();
+        for _ in 0..10 {
+            delay_ms(2).await;
+            if self.reset_complete() {
+                break;
+            }
+        }
+        self.configure(odr);
+        for _ in 0..10 {
+            delay_ms(10).await;
+            if self.is_continuous() {
+                return true;
+            }
+            self.start_continuous(odr);
+        }
+        false
+    }
+
     /// Read the latest magnetic field (µT) and die temperature (°C).
-    pub fn read(&mut self) -> MagSample {
+    fn read(&mut self) -> MagSample {
         let mut b = [0u8; 6];
         self.read_regs(REG_OUTX_L, &mut b);
         let le = |lo: usize, hi: usize| i16::from_le_bytes([b[lo], b[hi]]) as f32;

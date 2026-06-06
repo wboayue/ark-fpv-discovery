@@ -21,7 +21,7 @@ use stm32h7xx_hal::{
     prelude::*,
 };
 
-use super::{ImuOdr, ImuSample};
+use super::{Identify, Imu, ImuOdr, ImuSample, SoftReset};
 
 type Spi1 = hal::spi::Spi<hal::pac::SPI1, hal::spi::Enabled>;
 
@@ -64,12 +64,12 @@ const fn odr_reg(odr: ImuOdr) -> u8 {
     }
 }
 
-pub struct Imu {
+pub struct Iim42653 {
     spi: Spi1,
     cs: ErasedPin<Output<PushPull>>,
 }
 
-impl Imu {
+impl Iim42653 {
     /// Take ownership of the SPI1 bus and the (active-low) CS pin. CS idles high.
     pub fn new(spi: Spi1, mut cs: ErasedPin<Output<PushPull>>) -> Self {
         cs.set_high();
@@ -97,22 +97,32 @@ impl Imu {
         let _ = self.spi.transfer(buf);
         self.cs.set_high();
     }
+}
 
-    pub fn who_am_i(&mut self) -> u8 {
+impl Identify for Iim42653 {
+    fn read_id(&mut self) -> u8 {
         self.read_reg(WHO_AM_I)
     }
 
+    fn id_matches(id: u8) -> bool {
+        id == EXPECTED_WHO_AM_I
+    }
+}
+
+impl SoftReset for Iim42653 {
     /// Soft-reset to a known state (matters because we reboot/reflash often, not just power-cycle).
     /// Caller must wait ~2 ms afterwards before further access.
-    pub fn soft_reset(&mut self) {
+    fn soft_reset(&mut self) {
         self.write_reg(DEVICE_CONFIG, 0x01);
     }
+}
 
+impl Imu for Iim42653 {
     /// Configure for a control loop: set range/ODR + UI filtering, route data-ready to INT1, and
     /// power on gyro+accel in Low-Noise mode. All register writes happen while the sensors are
     /// still off (PWR_MGMT0 is written last), as the datasheet requires for the config registers.
     /// The DRDY interrupt then fires on INT1 at `odr` once the gyro has started (~50 ms).
-    pub fn configure_control_mode(&mut self, odr: ImuOdr) {
+    fn configure_control_mode(&mut self, odr: ImuOdr) {
         self.write_reg(REG_BANK_SEL, 0x00); // ensure bank 0
         let cfg = FS_SEL | odr_reg(odr);
         self.write_reg(ACCEL_CONFIG0, cfg);
@@ -126,12 +136,12 @@ impl Imu {
 
     /// Acknowledge the latched data-ready interrupt by reading INT_STATUS, which drops INT1.
     /// Must be called each sample in latched mode, or INT1 stays asserted and no further edge fires.
-    pub fn clear_interrupt(&mut self) {
+    fn clear_interrupt(&mut self) {
         let _ = self.read_reg(INT_STATUS);
     }
 
     /// Read one scaled sample (big-endian 16-bit registers).
-    pub fn read(&mut self) -> ImuSample {
+    fn read(&mut self) -> ImuSample {
         let mut b = [0u8; 15]; // 1 command + 14 data bytes
         self.read_burst(TEMP_DATA, &mut b);
         let be = |hi: usize, lo: usize| i16::from_be_bytes([b[hi], b[lo]]);

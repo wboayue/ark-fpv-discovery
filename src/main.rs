@@ -75,11 +75,12 @@ fn maybe_enter_bootloader() {
 #[rtic::app(device = stm32h7xx_hal::pac, peripherals = true, dispatchers = [FDCAN1_IT0])]
 mod app {
     use super::*;
-    use crate::sensors::baro::{Baro, CHIP_ID_BMP388, CHIP_ID_BMP390};
     use crate::fusion::{FusedState, Fusion, SensorState};
-    use crate::sensors::ImuSample;
-    use crate::sensors::imu::Imu;
-    use crate::sensors::mag::Mag;
+    use crate::sensors::bmp3xx::{Bmp3xx, CHIP_ID_BMP388, CHIP_ID_BMP390};
+    use crate::sensors::iim42653::Iim42653;
+    use crate::sensors::lis2mdl::Lis2mdl;
+    // Role + horizontal traits, in scope so their methods are callable on the concrete drivers.
+    use crate::sensors::{Baro, Identify, Imu, ImuSample, Mag, SoftReset};
     use discovery_telemetry as wire;
     // Serial output layer: text logging, binary framing, and the output-mode / diagnostic flags.
     use crate::telemetry::{
@@ -108,11 +109,11 @@ mod app {
     struct Local {
         counter: u32,
         leds: [ErasedPin<Output<PushPull>>; 3],
-        imu: Imu,
+        imu: Iim42653,
         imu_drdy: ErasedPin<Input>,
         imu_id: u8,
-        baro: Baro,
-        mag: Mag,
+        baro: Bmp3xx,
+        mag: Lis2mdl,
         fusion: Fusion,
     }
 
@@ -170,13 +171,13 @@ mod app {
             ccdr.peripheral.SPI1,
             &ccdr.clocks,
         );
-        let mut imu = Imu::new(spi, gpioi.pi9.into_push_pull_output().erase());
+        let mut imu = Iim42653::new(spi, gpioi.pi9.into_push_pull_output().erase());
         // Control-mode bring-up: reset, brief settle (~2 ms @ 400 MHz), then configure ODR,
         // filtering, and DRDY-on-INT1. The gyro takes ~50 ms to start — DRDY simply won't fire
         // until then, so no explicit wait is needed here.
         imu.soft_reset();
         cortex_m::asm::delay(800_000);
-        let imu_id = imu.who_am_i();
+        let imu_id = imu.read_id();
         imu.configure_control_mode(config::IMU_ODR);
 
         // IMU data-ready (INT1) → PF2 → EXTI line 2. Rising edge (INT1 is active-high push-pull).
@@ -198,7 +199,7 @@ mod app {
             ccdr.peripheral.I2C2,
             &ccdr.clocks,
         );
-        let baro = Baro::new(i2c);
+        let baro = Bmp3xx::new(i2c);
 
         // IIS2MDC/LIS2MDL magnetometer on I2C4: SCL=PF14, SDA=PF15 (AF4, open-drain). Like I2C2,
         // no kernel-clock setup needed — I2C4 runs off pclk4 (APB4/D3), always live after freeze().
@@ -211,7 +212,7 @@ mod app {
             ccdr.peripheral.I2C4,
             &ccdr.clocks,
         );
-        let mag = Mag::new(i2c4);
+        let mag = Lis2mdl::new(i2c4);
 
         // Sensor fusion (attitude + altitude). Owned by the fusion_step task; fed by the latest
         // IMU/mag/baro samples. 9-DOF vs 6-DOF is config::FUSION_USE_MAG.
@@ -382,7 +383,7 @@ mod app {
     // `n` is the DRDY count (confirms the real loop rate); `id` is the WHO_AM_I read at startup.
     #[task(shared = [serial])]
     async fn imu_log(mut cx: imu_log::Context, n: u32, id: u8, s: ImuSample) {
-        log_imu(&mut cx.shared.serial, n, id, crate::sensors::imu::EXPECTED_WHO_AM_I, &s);
+        log_imu(&mut cx.shared.serial, n, id, crate::sensors::iim42653::EXPECTED_WHO_AM_I, &s);
     }
 
     // Bring up the BMP388/BMP390 barometer (polled) and stream pressure/temp. Sample rate and
@@ -391,7 +392,7 @@ mod app {
     async fn baro_sample(mut cx: baro_sample::Context) {
         let baro = cx.local.baro;
 
-        let id = baro.chip_id();
+        let id = baro.read_id();
         let part = match id {
             CHIP_ID_BMP388 => "BMP388",
             CHIP_ID_BMP390 => "BMP390",
@@ -442,15 +443,15 @@ mod app {
     async fn mag_sample(mut cx: mag_sample::Context) {
         let mag = cx.local.mag;
 
-        let id = mag.who_am_i();
-        let matched = id == crate::sensors::mag::EXPECTED_WHO_AM_I;
+        let id = mag.read_id();
+        let matched = Lis2mdl::id_matches(id);
         emit_line(
             &mut cx.shared.serial,
             if matched { wire::Level::Info } else { wire::Level::Warn },
             format_args!(
                 "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}",
                 id,
-                crate::sensors::mag::EXPECTED_WHO_AM_I,
+                crate::sensors::lis2mdl::EXPECTED_WHO_AM_I,
                 if matched { "ok" } else { "MISMATCH" }
             ),
         );
@@ -478,7 +479,7 @@ mod app {
                 // Text + diag: verbose register dump (reads live config regs, so it stays here).
                 // Otherwise (binary, or text without diag) render the sample via the helper.
                 if !output_is_binary() && diag_enabled() {
-                    let id = mag.who_am_i();
+                    let id = mag.read_id();
                     let (ca, cb, cc) = mag.read_cfg();
                     log_fmt(
                         &mut cx.shared.serial,
