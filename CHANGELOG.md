@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Generic sensor traits in `src/sensors.rs` (`Sensor`, `Identify`, `SoftReset`, `BringUp`) naming the shared driver surface. Definitions only — no `impl`s yet (drivers adopt them in a follow-up).
+
 ### Changed
 
 - Sensor drivers grouped under a `sensors` module: `src/{imu,baro,mag}.rs` moved to `src/sensors/` behind a `src/sensors.rs` facade (no driver logic changed).
