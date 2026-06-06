@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, runs a **gyro-synchronous control loop off the IIM-42653 IMU's data-ready interrupt** (`src/imu.rs`, SPI1, default 1 kHz), polls the **BMP388/BMP390 barometer** (`src/baro.rs`, I2C2, 25 Hz) and the **IIS2MDC/LIS2MDL magnetometer** (`src/mag.rs`, I2C4, 50 Hz), streams their readings (logging throttled, decoupled from the loop), and emits a `tick` counter line once per second. Sensor/loop rates are configured in `src/config.rs`.
+`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, runs a **gyro-synchronous control loop off the IIM-42653 IMU's data-ready interrupt** (`src/sensors/imu.rs`, SPI1, default 1 kHz), polls the **BMP388/BMP390 barometer** (`src/sensors/baro.rs`, I2C2, 25 Hz) and the **IIS2MDC/LIS2MDL magnetometer** (`src/sensors/mag.rs`, I2C4, 50 Hz), streams their readings (logging throttled, decoupled from the loop), and emits a `tick` counter line once per second. Sensor/loop rates are configured in `src/config.rs`.
 
 Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller. The `stm32h743v` HAL feature and the `memory.x` layout below are chosen to match its MCU. Full pin map (sensors, LEDs, UARTs, motor outputs, ADC) is in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
@@ -30,7 +30,7 @@ Keep the code clean as it grows:
 
 - **No duplication (DRY)** — factor repeated logic/constants into one shared place; don't copy-paste. The sensor drivers share register-read/write patterns — extract a helper rather than re-inlining.
 - **Composable** — prefer small functions with clear inputs/outputs that combine, over large monolithic ones. Drivers expose narrow methods (`read_reg`, `configure`, `sample`) the tasks compose.
-- **Single responsibility (SRP)** — each module/struct/function does one thing. Keep sensor logic in its `src/<sensor>.rs` driver; keep RTIC tasks thin (orchestrate, don't embed driver internals).
+- **Single responsibility (SRP)** — each module/struct/function does one thing. Keep sensor logic in its `src/sensors/<sensor>.rs` driver; keep RTIC tasks thin (orchestrate, don't embed driver internals).
 
 Concrete examples of these in the tree (reuse them; don't re-inline their patterns):
 - **[`src/i2c_regs.rs`](src/i2c_regs.rs)** — generic `I2cRegs<I2C>` (bus + 7-bit address) with `read_reg`/`read_regs`/`write_reg`. `baro` and `mag` each *compose* one instead of duplicating identical I2C access code. New I2C sensors should too. (The SPI `imu` has its own access helpers — different bus, CS toggling — and stays standalone.)
@@ -41,7 +41,7 @@ Concrete examples of these in the tree (reuse them; don't re-inline their patter
 
 This is a hardware-bring-up project: nearly every magic number is a register address, bit field, or coefficient from a datasheet or reference driver — and they are easy to get subtly wrong (we've been bitten by hallucinated/transposed values more than once). So **always cite where a value came from**:
 
-- **In code**, put a comment next to any non-obvious constant naming its source (datasheet section, or a reputable driver — e.g. PX4 `InvenSense_ICM42688P_registers.hpp`, Bosch `BMP3_SensorAPI`, Betaflight). See `src/imu.rs` / `src/baro.rs` for the style.
+- **In code**, put a comment next to any non-obvious constant naming its source (datasheet section, or a reputable driver — e.g. PX4 `InvenSense_ICM42688P_registers.hpp`, Bosch `BMP3_SensorAPI`, Betaflight). See `src/sensors/imu.rs` / `src/sensors/baro.rs` for the style.
 - **In the README `## References` section**, list the authoritative source per sensor/subsystem, with a link.
 - **Vendor the datasheet** into [`docs/datasheets/`](docs/datasheets/) when the PDF is freely downloadable; link it when it's gated.
 - **Prefer primary sources** (datasheet, vendor reference driver) over forum posts or a model's recollection, and when sources disagree, note which you trusted and why. Verify a flagged value before flashing.
@@ -140,7 +140,7 @@ Everything lives in one `#[rtic::app]` module — there is no `main()`. Key conv
 
 Red `PE3` / green `PE4` / blue `PE5` (GPIOE), stored as an erased-pin array in `Local`. **Active-low** (confirmed on hardware): pin LOW = lit, HIGH = off. Configure with `into_push_pull_output_in_state(PinState::High)` to start off. `log_tick` blinks green as a heartbeat. Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
-## Sensors — IIM-42653 IMU (`src/imu.rs`)
+## Sensors — IIM-42653 IMU (`src/sensors/imu.rs`)
 
 First sensor brought up. Register-level driver, no external crate; interrupt-driven (see the control-loop subsection below). Things that bite:
 
@@ -164,7 +164,7 @@ The IMU drives a gyro-synchronous loop off its data-ready interrupt (INT1 → `P
 - Verify on hardware: log the DRDY counter `n` — every logged line should advance by exactly `IMU_LOG_DIV` (no big jumps = no storms); net Δn/sec ≈ ODR.
 - Known minor: a brief interrupt burst can occur at startup before the gyro stabilizes (EXTI is enabled in `init` before the ~50 ms gyro start). Steady state is clean; gating the EXTI enable on gyro-ready is a future hardening step.
 
-## Sensors — BMP388/BMP390 barometer (`src/baro.rs`)
+## Sensors — BMP388/BMP390 barometer (`src/sensors/baro.rs`)
 
 Second sensor. Register-level I2C2 driver, no external crate; composes the shared [`I2cRegs`](src/i2c_regs.rs) for register access. `Baro::bring_up` owns reset → settle → load calibration → configure → wait (the task just supplies an async delay). Things that bite:
 
@@ -176,7 +176,7 @@ Second sensor. Register-level I2C2 driver, no external crate; composes the share
 - Data: 6 bytes from `0x04`, little-endian (XLSB/LSB/MSB), pressure then temperature.
 - Sanity check on hardware: pressure ≈ 950–1030 hPa; temperature reads the sensor's *local* board temp (runs well above ambient near the H7 — ~50 °C observed), and breathing on the board swings it noticeably (toward breath temp).
 
-## Sensors — IIS2MDC/LIS2MDL magnetometer (`src/mag.rs`)
+## Sensors — IIS2MDC/LIS2MDL magnetometer (`src/sensors/mag.rs`)
 
 Third sensor. Register-level I2C4 driver, no external crate; composes the shared [`I2cRegs`](src/i2c_regs.rs) for register access. IIS2MDC (ArduPilot naming) and LIS2MDL (Betaflight) are the same ST 3-axis magnetometer at `0x1E` with an identical register map. Things to know:
 
