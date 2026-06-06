@@ -22,10 +22,10 @@ use rtic_monotonics::Monotonic; // brings `Mono::now()` / `.ticks()` into scope
 use stm32h7xx_hal::usb_hs::{UsbBus, USB2};
 use usbd_serial::SerialPort;
 
-use crate::baro::BaroSample;
+use crate::sensors::baro::BaroSample;
 use crate::fusion::FusedState;
-use crate::imu::ImuSample;
-use crate::mag::MagSample;
+use crate::sensors::imu::ImuSample;
+use crate::sensors::mag::MagSample;
 use crate::{Mono, config};
 
 /// The emit helpers are generic over the RTIC shared-resource proxy for the USB serial port.

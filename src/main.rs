@@ -3,12 +3,11 @@
 
 use panic_halt as _;
 
-mod baro;
+mod sensors;
+
 mod config;
 mod fusion;
 mod i2c_regs;
-mod imu;
-mod mag;
 mod telemetry;
 
 use stm32h7xx_hal as hal;
@@ -76,10 +75,10 @@ fn maybe_enter_bootloader() {
 #[rtic::app(device = stm32h7xx_hal::pac, peripherals = true, dispatchers = [FDCAN1_IT0])]
 mod app {
     use super::*;
-    use crate::baro::{Baro, CHIP_ID_BMP388, CHIP_ID_BMP390};
+    use crate::sensors::baro::{Baro, CHIP_ID_BMP388, CHIP_ID_BMP390};
     use crate::fusion::{FusedState, Fusion, SensorState};
-    use crate::imu::{Imu, ImuSample};
-    use crate::mag::Mag;
+    use crate::sensors::imu::{Imu, ImuSample};
+    use crate::sensors::mag::Mag;
     use discovery_telemetry as wire;
     // Serial output layer: text logging, binary framing, and the output-mode / diagnostic flags.
     use crate::telemetry::{
@@ -382,7 +381,7 @@ mod app {
     // `n` is the DRDY count (confirms the real loop rate); `id` is the WHO_AM_I read at startup.
     #[task(shared = [serial])]
     async fn imu_log(mut cx: imu_log::Context, n: u32, id: u8, s: ImuSample) {
-        log_imu(&mut cx.shared.serial, n, id, crate::imu::EXPECTED_WHO_AM_I, &s);
+        log_imu(&mut cx.shared.serial, n, id, crate::sensors::imu::EXPECTED_WHO_AM_I, &s);
     }
 
     // Bring up the BMP388/BMP390 barometer (polled) and stream pressure/temp. Sample rate and
@@ -443,14 +442,14 @@ mod app {
         let mag = cx.local.mag;
 
         let id = mag.who_am_i();
-        let matched = id == crate::mag::EXPECTED_WHO_AM_I;
+        let matched = id == crate::sensors::mag::EXPECTED_WHO_AM_I;
         emit_line(
             &mut cx.shared.serial,
             if matched { wire::Level::Info } else { wire::Level::Warn },
             format_args!(
                 "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}",
                 id,
-                crate::mag::EXPECTED_WHO_AM_I,
+                crate::sensors::mag::EXPECTED_WHO_AM_I,
                 if matched { "ok" } else { "MISMATCH" }
             ),
         );
