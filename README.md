@@ -37,15 +37,15 @@ firmware end of that link.
 The transport, dev loop, all three onboard sensors, and sensor fusion are up.
 
 - Enumerates as a USB CDC serial device; readings stream out over it.
-- **IIM-42653 IMU on SPI1** (`src/sensors/iim42653.rs`): SPI1 (SCK `PA5` / MISO `PG9` / MOSI `PB5`, soft CS
+- **IIM-42653 IMU on SPI1** (`src/sensors/imu.rs`): SPI1 (SCK `PA5` / MISO `PG9` / MOSI `PB5`, soft CS
   `PI9`, MODE_3), WHO_AM_I `0x56`, ±16g / ±2000 dps, anti-alias + UI filtering. Driven by its
   **hardware data-ready interrupt** (INT1 → `PF2` → EXTI) for a **gyro-synchronous control loop**
   at the configured ODR (default **1 kHz**) — low-jitter, deterministic. Serial logging is
   decoupled (every Nth sample) so USB never gates the loop.
-- **BMP388/BMP390 barometer on I2C2** (`src/sensors/bmp3xx.rs`): I2C2 (SCL `PF1` / SDA `PF0`, AF4 open-drain)
+- **BMP388/BMP390 barometer on I2C2** (`src/sensors/baro.rs`): I2C2 (SCL `PF1` / SDA `PF0`, AF4 open-drain)
   at `0x76`, CHIP_ID-checked (`0x50`/`0x60`), normal-mode, factory NVM calibration + Bosch float
   compensation. Polled at 25 Hz (low-bandwidth — it can't and needn't match the IMU rate).
-- **IIS2MDC/LIS2MDL magnetometer on I2C4** (`src/sensors/lis2mdl.rs`): I2C4 (SCL `PF14` / SDA `PF15`, AF4
+- **IIS2MDC/LIS2MDL magnetometer on I2C4** (`src/sensors/mag.rs`): I2C4 (SCL `PF14` / SDA `PF15`, AF4
   open-drain) at `0x1E`, WHO_AM_I-checked (`0x40`), continuous-conversion mode with on-chip
   temperature compensation and offset cancellation. Reports the field in µT (1.5 mgauss/LSB) plus
   die temperature. Polled at 50 Hz (low-bandwidth, like the baro). The first continuous-mode write
@@ -191,9 +191,9 @@ per-sensor quirks, fusion axis/dt gotchas).
 | ------------------------ | ------------------------------------------------ |
 | `src/main.rs`            | The `#[rtic::app]` module — init, tasks, peripheral wiring |
 | `src/sensors.rs`         | Sensor role layer: contract types + role traits (`Imu`/`Baro`/`Mag`); re-exports the drivers |
-| `src/sensors/iim42653.rs`     | IIM-42653 IMU driver (SPI1)                       |
-| `src/sensors/bmp3xx.rs`    | BMP388/BMP390 barometer driver (I2C2)             |
-| `src/sensors/lis2mdl.rs`     | IIS2MDC/LIS2MDL magnetometer driver (I2C4)        |
+| `src/sensors/imu.rs`     | IIM-42653 IMU driver (SPI1)                       |
+| `src/sensors/baro.rs`    | BMP388/BMP390 barometer driver (I2C2)             |
+| `src/sensors/mag.rs`     | IIS2MDC/LIS2MDL magnetometer driver (I2C4)        |
 | `src/fusion.rs`          | Sensor fusion: attitude (fusion-ahrs) + altitude (fusion-altitude) |
 | `src/telemetry.rs`       | Serial output layer: text logging + binary (`discovery-telemetry`) framing, `b`/`t`/`d` mode flags |
 | `src/config.rs`          | Tunable sensor/loop rates, fusion gains, output-mode default |
@@ -217,7 +217,7 @@ Datasheets and reference drivers the sensor code is built from. Local PDF copies
   [`docs/datasheets/bmp390-ds002.pdf`](docs/datasheets/bmp390-ds002.pdf) (register map, CHIP_ID,
   PWR_CTRL/OSR bit fields, ODR/OSR timing), and the Bosch
   [BMP3_SensorAPI](https://github.com/boschsensortec/BMP3_SensorAPI) — source of the NVM
-  calibration scaling and float compensation in `src/sensors/bmp3xx.rs`.
+  calibration scaling and float compensation in `src/sensors/baro.rs`.
 - **IMU (IIM-42653)** — TDK
   [IIM-42653 product page](https://invensense.tdk.com/products/smartindustrial/iim-42653/) (the
   datasheet PDF is gated, so it isn't vendored), the register-identical PX4
@@ -230,7 +230,7 @@ Datasheets and reference drivers the sensor code is built from. Local PDF copies
   it isn't vendored) and ST's official driver
   [`lis2mdl-pid`](https://github.com/STMicroelectronics/lis2mdl-pid)
   (`lis2mdl_reg.h`/`lis2mdl_reg.c`) — source of the register map, CFG bit fields, WHO_AM_I `0x40`,
-  and the LSB scaling (1.5 mgauss/LSB; temp `lsb/8 + 25 °C`) in `src/sensors/lis2mdl.rs`. IIS2MDC (ArduPilot)
+  and the LSB scaling (1.5 mgauss/LSB; temp `lsb/8 + 25 °C`) in `src/sensors/mag.rs`. IIS2MDC (ArduPilot)
   and LIS2MDL (Betaflight) are the same part at `0x1E`.
 - **Sensor fusion** — [`fusion-ahrs`](https://github.com/wboayue/fusion-ahrs) (attitude; a Rust
   port of xioTechnologies' Fusion AHRS — gain/rejection settings follow its canonical example) and

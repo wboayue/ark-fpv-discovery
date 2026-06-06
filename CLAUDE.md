@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, runs a **gyro-synchronous control loop off the IIM-42653 IMU's data-ready interrupt** (`src/sensors/iim42653.rs`, SPI1, default 1 kHz), polls the **BMP388/BMP390 barometer** (`src/sensors/bmp3xx.rs`, I2C2, 25 Hz) and the **IIS2MDC/LIS2MDL magnetometer** (`src/sensors/lis2mdl.rs`, I2C4, 50 Hz), streams their readings (logging throttled, decoupled from the loop), and emits a `tick` counter line once per second. Sensor/loop rates are configured in `src/config.rs`.
+`ark-discovery` — bare-metal (`#![no_std]`) firmware targeting the **ARK FPV** board (STM32H743, Cortex-M7), built on the [RTIC 2](https://rtic.rs) async framework. Current functionality: enumerates as a USB CDC serial device, runs a **gyro-synchronous control loop off the IIM-42653 IMU's data-ready interrupt** (`src/sensors/imu.rs`, SPI1, default 1 kHz), polls the **BMP388/BMP390 barometer** (`src/sensors/baro.rs`, I2C2, 25 Hz) and the **IIS2MDC/LIS2MDL magnetometer** (`src/sensors/mag.rs`, I2C4, 50 Hz), streams their readings (logging throttled, decoupled from the loop), and emits a `tick` counter line once per second. Sensor/loop rates are configured in `src/config.rs`.
 
 Target board: [ARK FPV](https://arkelectron.com/product/ark-fpv/) flight controller. The `stm32h743v` HAL feature and the `memory.x` layout below are chosen to match its MCU. Full pin map (sensors, LEDs, UARTs, motor outputs, ADC) is in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
@@ -30,19 +30,19 @@ Keep the code clean as it grows:
 
 - **No duplication (DRY)** — factor repeated logic/constants into one shared place; don't copy-paste. The sensor drivers share register-read/write patterns — extract a helper rather than re-inlining.
 - **Composable** — prefer small functions with clear inputs/outputs that combine, over large monolithic ones. Drivers expose narrow methods (`read_reg`, `configure`, `sample`) the tasks compose.
-- **Single responsibility (SRP)** — each module/struct/function does one thing. Keep sensor logic in its `src/sensors/<partname>.rs` driver; keep RTIC tasks thin (orchestrate, don't embed driver internals).
+- **Single responsibility (SRP)** — each module/struct/function does one thing. Keep sensor logic in its `src/sensors/<role>.rs` driver; keep RTIC tasks thin (orchestrate, don't embed driver internals).
 
 Concrete examples of these in the tree (reuse them; don't re-inline their patterns):
-- **[`src/i2c_regs.rs`](src/i2c_regs.rs)** — generic `I2cRegs<I2C>` (bus + 7-bit address) with `read_reg`/`read_regs`/`write_reg`. `bmp3xx` and `lis2mdl` each *compose* one instead of duplicating identical I2C access code. New I2C sensors should too. (The SPI `iim42653` has its own access helpers — different bus, CS toggling — and stays standalone.)
+- **[`src/i2c_regs.rs`](src/i2c_regs.rs)** — generic `I2cRegs<I2C>` (bus + 7-bit address) with `read_reg`/`read_regs`/`write_reg`. `baro` and `mag` each *compose* one instead of duplicating identical I2C access code. New I2C sensors should too. (The SPI `imu` has its own access helpers — different bus, CS toggling — and stays standalone.)
 - **`log_fmt(serial, format_args!(…))`** in `main.rs` — the one place that formats a line into a stack buffer and writes it to USB serial. It owns the single buffer size (`LOG_LINE_CAP`), so call sites carry no magic number. Use it (with `format_args!`) for all serial logging; don't hand-roll `String::new()`/`write!`/`write_serial`. Prefer this plain function over a wrapper macro — a sugar-only macro isn't worth the indirection.
 - **Driver `bring_up(…)`** (`Baro::bring_up`, `Mag::bring_up`) — own the device's reset/settle/retry *protocol* (timing, retry counts, what "ready/latched" means), taking an injected async delay closure (`|ms| Mono::delay(ms.millis())`) so the RTIC monotonic stays in `main` while the chip quirks live in the driver. This is how tasks stay thin.
-- **[`src/sensors.rs`](src/sensors.rs) is the sensor *role layer*** — the contract every sensor of a role produces, kept separate from the concrete chip. It holds (a) the **contract types**: sample structs (`ImuSample`/`BaroSample`/`MagSample`) and the *logical* config enums (`ImuOdr`/`BaroOdr`/`Oversampling`/`MagOdr`, `ConfigError`); and (b) the **role traits** `Imu`/`Baro`/`Mag` plus horizontal `Identify`/`SoftReset`. Each driver module is named for its part (`iim42653`/`bmp3xx`/`lis2mdl`, structs `Iim42653`/`Bmp3xx`/`Lis2mdl`) and `impl`s its role trait + `Identify`/`SoftReset`; `main` calls those trait methods on the owned concrete type (so the traits must be `use`d in scope). **A logical config enum names a rate/quantity, not a register value** — the chip-specific encoding stays *private to the driver* as `odr_reg`/`osr_reg` (datasheet-cited there), so a second IMU can satisfy the same `ImuOdr` with a different encoding. The enums carry `#[allow(dead_code)]` because they enumerate the full hardware mode set while `config` selects a subset. New sensor of an existing role → new `partname` module with a struct `impl`ing the role trait + an `*_reg` mapping; genuinely new role → add a contract type + role trait here. The remaining swappability step is making `fusion` generic over `impl Imu/Baro/Mag`. Don't put register codes on the lifted enums.
+- **[`src/sensors.rs`](src/sensors.rs) is the sensor *role layer*** — the contract every sensor of a role produces, kept separate from the concrete chip. It holds (a) the **contract types**: sample structs (`ImuSample`/`BaroSample`/`MagSample`) and the *logical* config enums (`ImuOdr`/`BaroOdr`/`Oversampling`/`MagOdr`, `ConfigError`); and (b) the **role traits** `Imu`/`Baro`/`Mag` plus horizontal `Identify`/`SoftReset`. Each driver lives in a **role-named module** (`imu`/`baro`/`mag` — one impl per role per firmware) whose **struct names the part currently filling it** (`imu::Iim42653`, `baro::Bmp3xx`, `mag::Lis2mdl`); the struct `impl`s its role trait + `Identify`/`SoftReset`, and `main` calls those trait methods on the owned concrete type (so the traits must be `use`d in scope). Module `imu` and trait `Imu` don't clash — different namespaces and case — which is why the struct (not the module) carries the part name. **A logical config enum names a rate/quantity, not a register value** — the chip-specific encoding stays *private to the driver* as `odr_reg`/`osr_reg` (datasheet-cited there), so a second IMU can satisfy the same `ImuOdr` with a different encoding. The enums carry `#[allow(dead_code)]` because they enumerate the full hardware mode set while `config` selects a subset. Swapping the part for an existing role → replace the struct in the role module (new `impl <Role>` + `*_reg` mapping) and the one `::new()` line in `main`; the module path stays stable. Genuinely new role → add a contract type + role trait here. The remaining swappability step is making `fusion` generic over `impl Imu/Baro/Mag`. Don't put register codes on the lifted enums.
 
 ## Always document sources
 
 This is a hardware-bring-up project: nearly every magic number is a register address, bit field, or coefficient from a datasheet or reference driver — and they are easy to get subtly wrong (we've been bitten by hallucinated/transposed values more than once). So **always cite where a value came from**:
 
-- **In code**, put a comment next to any non-obvious constant naming its source (datasheet section, or a reputable driver — e.g. PX4 `InvenSense_ICM42688P_registers.hpp`, Bosch `BMP3_SensorAPI`, Betaflight). See `src/sensors/iim42653.rs` / `src/sensors/bmp3xx.rs` for the style.
+- **In code**, put a comment next to any non-obvious constant naming its source (datasheet section, or a reputable driver — e.g. PX4 `InvenSense_ICM42688P_registers.hpp`, Bosch `BMP3_SensorAPI`, Betaflight). See `src/sensors/imu.rs` / `src/sensors/baro.rs` for the style.
 - **In the README `## References` section**, list the authoritative source per sensor/subsystem, with a link.
 - **Vendor the datasheet** into [`docs/datasheets/`](docs/datasheets/) when the PDF is freely downloadable; link it when it's gated.
 - **Prefer primary sources** (datasheet, vendor reference driver) over forum posts or a model's recollection, and when sources disagree, note which you trusted and why. Verify a flagged value before flashing.
@@ -141,13 +141,13 @@ Everything lives in one `#[rtic::app]` module — there is no `main()`. Key conv
 
 Red `PE3` / green `PE4` / blue `PE5` (GPIOE), stored as an erased-pin array in `Local`. **Active-low** (confirmed on hardware): pin LOW = lit, HIGH = off. Configure with `into_push_pull_output_in_state(PinState::High)` to start off. `log_tick` blinks green as a heartbeat. Full pin map in [`docs/ark-fpv-board.md`](docs/ark-fpv-board.md).
 
-## Sensors — IIM-42653 IMU (`src/sensors/iim42653.rs`)
+## Sensors — IIM-42653 IMU (`src/sensors/imu.rs`)
 
 First sensor brought up. Register-level driver, no external crate; interrupt-driven (see the control-loop subsection below). Things that bite:
 
 - **SPI1 needs `pll1_q_ck` enabled in the rcc chain** (`.sys_ck(400.MHz()).pll1_q_ck(80.MHz())`). PLL1_Q is SPI1's kernel clock and the HAL `.expect()`s it when building the SPI — without it `init` **panics** (which looks exactly like a hung boot: no CDC). Independent of the HSI48 USB path.
 - Pins: SCK `PA5` / MISO `PG9` / MOSI `PB5`, all **AF5** (`into_alternate::<5>()`); soft CS `PI9` driven as GPIO (active-low). **MODE_3** (CPOL=1, CPHA=1), ~8 MHz (24 MHz max). Reads use `reg | 0x80`.
-- **WHO_AM_I (`0x75`) = `0x56`** for the IIM-42653 — *not* the ICM-42688's `0x47`. `EXPECTED_WHO_AM_I` in `iim42653.rs`.
+- **WHO_AM_I (`0x75`) = `0x56`** for the IIM-42653 — *not* the ICM-42688's `0x47`. `EXPECTED_WHO_AM_I` in `imu.rs`.
 - **PWR_MGMT0 (`0x4E`) = `0x0F`**: GYRO_MODE bits[3:2] + ACCEL_MODE bits[1:0], both `0b11` = Low-Noise.
 - **The IIM-42653 is the wide-range part (±32g / ±4000 dps), so its FS_SEL table is shifted up one step vs the ICM-42688**: `FS_SEL=000` = max range here. We select `FS_SEL=001` → ±16g / ±2000 dps, giving the standard 2048 LSB/g and 16.384 LSB/dps. Scaling constants depend on the selected range — change the range, change the constants.
 - Data is big-endian; burst-read `0x1D..=0x2A` (TEMP, ACCEL XYZ, GYRO XYZ) in one transaction. Soft-reset (DEVICE_CONFIG `0x11` = `0x01`) on startup gives a known state across our frequent reboots; wait ~2 ms after (a `cortex_m::asm::delay` busy-wait in `init`), then ~50 ms for the gyro to start (the DRDY just won't fire until it has).
@@ -165,7 +165,7 @@ The IMU drives a gyro-synchronous loop off its data-ready interrupt (INT1 → `P
 - Verify on hardware: log the DRDY counter `n` — every logged line should advance by exactly `IMU_LOG_DIV` (no big jumps = no storms); net Δn/sec ≈ ODR.
 - Known minor: a brief interrupt burst can occur at startup before the gyro stabilizes (EXTI is enabled in `init` before the ~50 ms gyro start). Steady state is clean; gating the EXTI enable on gyro-ready is a future hardening step.
 
-## Sensors — BMP388/BMP390 barometer (`src/sensors/bmp3xx.rs`)
+## Sensors — BMP388/BMP390 barometer (`src/sensors/baro.rs`)
 
 Second sensor. Register-level I2C2 driver, no external crate; composes the shared [`I2cRegs`](src/i2c_regs.rs) for register access. `Baro::bring_up` owns reset → settle → load calibration → configure → wait (the task just supplies an async delay). Things that bite:
 
@@ -177,7 +177,7 @@ Second sensor. Register-level I2C2 driver, no external crate; composes the share
 - Data: 6 bytes from `0x04`, little-endian (XLSB/LSB/MSB), pressure then temperature.
 - Sanity check on hardware: pressure ≈ 950–1030 hPa; temperature reads the sensor's *local* board temp (runs well above ambient near the H7 — ~50 °C observed), and breathing on the board swings it noticeably (toward breath temp).
 
-## Sensors — IIS2MDC/LIS2MDL magnetometer (`src/sensors/lis2mdl.rs`)
+## Sensors — IIS2MDC/LIS2MDL magnetometer (`src/sensors/mag.rs`)
 
 Third sensor. Register-level I2C4 driver, no external crate; composes the shared [`I2cRegs`](src/i2c_regs.rs) for register access. IIS2MDC (ArduPilot naming) and LIS2MDL (Betaflight) are the same ST 3-axis magnetometer at `0x1E` with an identical register map. Things to know:
 

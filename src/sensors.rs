@@ -2,15 +2,18 @@
 //! role traits (`Imu`, `Baro`, `Mag`) that fusion/tasks can eventually be written against so the
 //! concrete chip behind each role is swappable.
 //!
-//! The submodules are the current concrete drivers, each named for its part — self-contained,
-//! `no_std`, no-external-crate: `iim42653` (IMU on SPI1) and `bmp3xx`/`lis2mdl` (baro/mag,
-//! composing the shared [`crate::i2c_regs::I2cRegs`] on I2C2/I2C4). Each implements its role trait
-//! (`Iim42653: Imu`, etc.) and produces the contract types defined here.
+//! The submodules are role slots — one concrete driver each (a firmware build has one IMU, one
+//! baro, one mag). Self-contained, `no_std`, no-external-crate: `imu` (SPI1) and `baro`/`mag`
+//! (composing the shared [`crate::i2c_regs::I2cRegs`] on I2C2/I2C4). The module names the role; the
+//! struct names the part currently filling it (`imu::Iim42653`, `baro::Bmp3xx`, `mag::Lis2mdl`),
+//! and each implements its role trait (`impl Imu for Iim42653`, etc.) and produces the contract
+//! types defined here. Swapping the part means a new struct `impl`ing the same role trait and one
+//! changed `::new()` line in `main`; the module path stays stable.
 //!
 //! **Contract vs. encoding.** The sample structs and the *logical* config enums (e.g.
 //! `ImuOdr { Hz200, Hz500, Hz1000 }`) live here — they name a rate/quantity, not a register value.
-//! Each driver maps them to its own chip registers privately (e.g. `iim42653::odr_reg`), so a
-//! second IMU could satisfy the same `ImuOdr` with a different encoding. Datasheet citations for
+//! Each driver maps them to its own chip registers privately (e.g. `imu::odr_reg`), so a second
+//! IMU could satisfy the same `ImuOdr` with a different encoding. Datasheet citations for
 //! the register values stay with those per-driver mappings.
 //!
 //! Each concrete driver `impl`s its role trait (plus the horizontal `Identify`/`SoftReset`); the
@@ -21,9 +24,9 @@
 
 use core::future::Future;
 
-pub(crate) mod bmp3xx;
-pub(crate) mod iim42653;
-pub(crate) mod lis2mdl;
+pub(crate) mod baro;
+pub(crate) mod imu;
+pub(crate) mod mag;
 
 // =============================================================================
 // Contract types — the role layer's vocabulary (units + logical config).

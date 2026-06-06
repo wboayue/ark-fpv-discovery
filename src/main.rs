@@ -76,9 +76,9 @@ fn maybe_enter_bootloader() {
 mod app {
     use super::*;
     use crate::fusion::{FusedState, Fusion, SensorState};
-    use crate::sensors::bmp3xx::{Bmp3xx, CHIP_ID_BMP388, CHIP_ID_BMP390};
-    use crate::sensors::iim42653::Iim42653;
-    use crate::sensors::lis2mdl::Lis2mdl;
+    use crate::sensors::baro::{Bmp3xx, CHIP_ID_BMP388, CHIP_ID_BMP390};
+    use crate::sensors::imu::Iim42653;
+    use crate::sensors::mag::Lis2mdl;
     // Role + horizontal traits, in scope so their methods are callable on the concrete drivers.
     use crate::sensors::{Baro, Identify, Imu, ImuSample, Mag, SoftReset};
     use discovery_telemetry as wire;
@@ -383,7 +383,7 @@ mod app {
     // `n` is the DRDY count (confirms the real loop rate); `id` is the WHO_AM_I read at startup.
     #[task(shared = [serial])]
     async fn imu_log(mut cx: imu_log::Context, n: u32, id: u8, s: ImuSample) {
-        log_imu(&mut cx.shared.serial, n, id, crate::sensors::iim42653::EXPECTED_WHO_AM_I, &s);
+        log_imu(&mut cx.shared.serial, n, id, crate::sensors::imu::EXPECTED_WHO_AM_I, &s);
     }
 
     // Bring up the BMP388/BMP390 barometer (polled) and stream pressure/temp. Sample rate and
@@ -451,7 +451,7 @@ mod app {
             format_args!(
                 "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}",
                 id,
-                crate::sensors::lis2mdl::EXPECTED_WHO_AM_I,
+                crate::sensors::mag::EXPECTED_WHO_AM_I,
                 if matched { "ok" } else { "MISMATCH" }
             ),
         );
