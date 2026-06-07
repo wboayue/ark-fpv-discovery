@@ -1,3 +1,40 @@
+//! # Sensing strategy — what each sensor contributes to the estimate
+//!
+//! A flight controller can't measure its attitude or altitude directly; it *infers* them by fusing
+//! complementary sensors, each strong where another is weak:
+//!
+//! - **Gyroscope** (IMU, [`ImuSample::gyro_dps`]) — angular *rate*. Fast and clean enough to drive
+//!   the control loop, but integrating it to an angle **drifts** (bias accumulates without bound).
+//! - **Accelerometer** (IMU, [`ImuSample::accel_g`]) — senses the gravity vector at rest, giving an
+//!   absolute **tilt** (roll/pitch) reference that corrects gyro drift. Can't see yaw (gravity is
+//!   symmetric about vertical) and is corrupted by linear acceleration / vibration in flight.
+//! - **Magnetometer** ([`MagSample::field_ut`]) — Earth's field gives an absolute **heading (yaw)**
+//!   reference, the one axis the accel can't fix. Easily distorted by nearby iron/current, so it
+//!   needs field calibration to be trustworthy (see "Calibration" below).
+//! - **Barometer** ([`BaroSample::pressure_hpa`]) — air pressure → **altitude** and its derivative,
+//!   vertical speed. Slow, noisy, and sensitive to prop-wash/wind, but the only onboard absolute
+//!   altitude source.
+//!
+//! So: gyro for *rate*, accel to stop roll/pitch drifting, mag to stop yaw drifting, baro for
+//! altitude. Turning all four into a single attitude + altitude estimate is [`crate::fusion`]'s job.
+//!
+//! **Sampling paradigm follows the physics.** The gyro must be sampled *synchronously* at a high,
+//! fixed rate — jitter or aliasing in the rate signal feeds straight into the control loop — so the
+//! IMU is **interrupt-driven**: it raises a data-ready line at its ODR and the [`Imu`] role has no
+//! `bring_up`/poll method (the EXTI/DRDY path lives in `main`). The baro and mag change slowly (tens
+//! of Hz), so they are **polled** on a timer and own an async `bring_up` that hides the chip's
+//! reset/settle quirks. Interrupt for the fast, drift-critical sensor; polling for the slow ones —
+//! the same split full flight stacks make.
+//!
+//! **Calibration comes in two kinds.** The baro loads *factory* trim ([`baro::Bmp3xx::read_calibration`])
+//! and the mag enables *on-chip* offset/temperature compensation — but neither is **field
+//! calibration**: gyro bias, accel six-position, and especially magnetometer hard/soft-iron
+//! correction are vehicle-specific and still owed before the estimate is flight-trustworthy (on a
+//! cluttered metal bench the mag already reads 2–3× Earth's field from hard-iron alone). Treat the
+//! samples here as *raw, factory-compensated* — not yet *calibrated for this airframe*.
+//!
+//! ---
+//!
 //! The sensor **role layer**: the contract types every sensor of a given role produces, and the
 //! role traits (`Imu`, `Baro`, `Mag`) that fusion/tasks can eventually be written against so the
 //! concrete chip behind each role is swappable.
@@ -49,6 +86,11 @@ pub(crate) type MagDriver = mag::Lis2mdl;
 // =============================================================================
 
 /// One scaled IMU sample: accel in g, gyro in dps, temperature in °C.
+///
+/// Axes are the **raw chip frame** (the IIM-42653's own X/Y/Z as soldered on the board) — *not* the
+/// vehicle body frame. The board-mounting rotation into the body/NWU frame happens once, downstream,
+/// in [`crate::fusion`] (`to_body_frame`). Keeping the driver frame-agnostic is deliberate: the
+/// remap depends on how the chip is mounted, which is a vehicle fact, not a sensor fact.
 #[derive(Clone, Copy)]
 pub struct ImuSample {
     pub accel_g: [f32; 3],
@@ -145,6 +187,10 @@ pub enum ConfigError {
 }
 
 /// One scaled magnetometer sample: field in µT, die temperature in °C.
+///
+/// Like [`ImuSample`], `field_ut` is in the **raw chip frame**, not the body frame; the remap is
+/// applied downstream in [`crate::fusion`]. The mag is assumed co-framed with the IMU — if heading
+/// (yaw) is wrong while roll/pitch are right, the mag needs its own axis remap.
 #[derive(Clone, Copy)]
 pub struct MagSample {
     pub field_ut: [f32; 3],
