@@ -1,3 +1,55 @@
+//! ark-discovery firmware — bare-metal RTIC app for the ARK FPV (STM32H743) flight controller.
+//!
+//! # What this firmware does
+//!
+//! Reads three sensors, fuses them into an attitude + altitude estimate, and streams telemetry over
+//! USB CDC serial. It is a *sensing / estimation* platform, **not** a full flight stack: there is no
+//! control law and no actuation — the fused estimate (the `fused` resource) is the endpoint, with a
+//! marked `// (control step goes here)` seam in `imu_drdy` for where a rate loop would attach. See
+//! [`mod sensors`](crate::sensors) for the sensing strategy and `CLAUDE.md` for the scope rationale.
+//!
+//! # Concurrency model (RTIC)
+//!
+//! Everything lives in one `#[rtic::app] mod app` — there is no `main()`. Work is split across tasks
+//! by *rate* and *criticality*: one fast synchronous loop that must never be blocked, and slower
+//! cooperative work underneath it. That ordering — a high-rate sensor/estimation loop above
+//! lower-rate IO — is the rate-monotonic shape every flight controller has.
+//!
+//! | Task          | Trigger / rate             | Prio | Role                                       |
+//! |---------------|----------------------------|------|--------------------------------------------|
+//! | `imu_drdy`    | IMU DRDY irq (EXTI2) @ ODR  | 2    | fast loop: read IMU, accumulate for fusion |
+//! | `fusion_step` | timer @ `FUSION_RATE_HZ`    | 1    | drain IMU mean + mag/baro → estimate       |
+//! | `baro_sample` | timer @ `BARO_SAMPLE_HZ`    | 1    | poll the barometer                         |
+//! | `mag_sample`  | timer @ `MAG_SAMPLE_HZ`     | 1    | poll the magnetometer                      |
+//! | `imu_log`     | spawned by `imu_drdy`       | 1    | format/emit an IMU sample (off the ISR)    |
+//! | `log_tick`    | timer @ 1 Hz               | 1    | heartbeat LED + tick line                  |
+//! | `usb_irq`     | USB irq (OTG_FS)           | 1    | host control bytes + telemetry mode        |
+//!
+//! **Why only `imu_drdy` is high priority:** the gyro-synchronous loop must preempt all logging/IO
+//! so its timing never jitters — jitter or aliasing in the rate signal would feed straight into a
+//! control loop. Everything else shares priority 1 as `async` software tasks run off one donated
+//! interrupt vector (`dispatchers = [FDCAN1_IT0]`); add vectors only when introducing new priority
+//! levels. Critically, `imu_drdy` never touches `serial`, so USB can never stall the fast loop.
+//!
+//! # Data flow (producer → consumer)
+//!
+//! Two `#[shared]` resources carry data between tasks, both latest-wins (no queues):
+//!
+//! ```text
+//!   imu_drdy ──accumulate─┐
+//!   baro_sample ──write──►│ latest (sensor inbox) ──drain──► fusion_step ──► fused ──► loggers /
+//!   mag_sample ──write────┘                                  (estimate)      future control loop
+//! ```
+//!
+//! - **`latest`** is the sensor inbox: producers write the newest reading; `fusion_step` drains the
+//!   accumulated IMU mean + latest mag/pressure each tick. Because `imu_drdy` (priority 2) touches
+//!   it, RTIC raises `latest`'s ceiling to priority 2 — so **every critical section on it must be a
+//!   tiny copy/add, never fusion math** (the heavy `nalgebra`/`libm` math runs outside the lock).
+//! - **`fused`** is the estimation output, stored for loggers and a future control loop to read.
+//!
+//! `CLAUDE.md` has the full subsystem notes (clock traps, the latched-interrupt storm, sensor
+//! bring-up quirks); the per-sensor register facts live in each `src/sensors/<role>.rs` driver.
+
 #![no_std]
 #![no_main]
 
@@ -115,6 +167,12 @@ mod app {
         fusion: Fusion,
     }
 
+    // `ep_mem` and `usb_bus` are `#[init]` local statics on purpose: the USB allocator and the bus
+    // it owns must live for `'static`, because the `SerialPort`/`UsbDevice` built below borrow from
+    // the bus for `'static` and are returned out of `init`. Local statics give that `'static`
+    // backing storage; the `Option<…> = None` + `.replace()` dance lets us *build* the bus inside
+    // `init` (it needs runtime values) yet hand out a `'static` reference to it. A common
+    // embedded-Rust pattern for "construct at runtime, but the borrow must outlive the constructor".
     #[init(local = [
         ep_mem: [u32; 1024] = [0; 1024],
         usb_bus: Option<UsbBusAllocator<UsbBus<USB2>>> = None,
@@ -239,6 +297,8 @@ mod app {
             &ccdr.clocks,
         );
 
+        // Stash the bus in the `'static` local so the SerialPort/UsbDevice below can borrow it for
+        // `'static` (see the `#[init(local = …)]` comment above).
         let bus = UsbBus::new(usb, cx.local.ep_mem);
         cx.local.usb_bus.replace(bus);
 
