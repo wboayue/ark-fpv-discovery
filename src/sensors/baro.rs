@@ -14,6 +14,7 @@ use core::future::Future;
 
 use stm32h7xx_hal as hal;
 
+use super::{Baro, BaroOdr, BaroSample, ConfigError, Identify, Oversampling, SoftReset};
 use crate::i2c_regs::I2cRegs;
 
 type I2c2 = hal::i2c::I2c<hal::pac::I2C2>;
@@ -47,72 +48,29 @@ const SETTLE_TEMP_US: u32 = 313;
 const ADC_CONV_US: u32 = 2000;
 const MEAS_BASE_US: u32 = 234;
 
-/// Output data rate (`ODR` register `0x1D`). Coupled to oversampling by the timing rule above.
-#[derive(Clone, Copy)]
-pub enum BaroOdr {
-    Hz200,
-    Hz100,
-    Hz50,
-    Hz25,
-    Hz12_5,
-}
-
-impl BaroOdr {
-    const fn reg(self) -> u8 {
-        match self {
-            BaroOdr::Hz200 => 0x00,
-            BaroOdr::Hz100 => 0x01,
-            BaroOdr::Hz50 => 0x02,
-            BaroOdr::Hz25 => 0x03,
-            BaroOdr::Hz12_5 => 0x04,
-        }
-    }
-
-    const fn period_us(self) -> u32 {
-        match self {
-            BaroOdr::Hz200 => 5_000,
-            BaroOdr::Hz100 => 10_000,
-            BaroOdr::Hz50 => 20_000,
-            BaroOdr::Hz25 => 40_000,
-            BaroOdr::Hz12_5 => 80_000,
-        }
+/// Map the logical [`BaroOdr`] to the ODR register (`0x1D`) code. Values per the Bosch BMP3
+/// datasheet (`bmp3_defs.h` `BMP3_ODR_*`).
+const fn odr_reg(odr: BaroOdr) -> u8 {
+    match odr {
+        BaroOdr::Hz200 => 0x00,
+        BaroOdr::Hz100 => 0x01,
+        BaroOdr::Hz50 => 0x02,
+        BaroOdr::Hz25 => 0x03,
+        BaroOdr::Hz12_5 => 0x04,
     }
 }
 
-/// Oversampling factor (`OSR` register fields). Value is the register code; `factor = 1 << code`.
-#[derive(Clone, Copy)]
-pub enum Oversampling {
-    X1,
-    X2,
-    X4,
-    X8,
-    X16,
-    X32,
-}
-
-impl Oversampling {
-    const fn reg(self) -> u8 {
-        match self {
-            Oversampling::X1 => 0,
-            Oversampling::X2 => 1,
-            Oversampling::X4 => 2,
-            Oversampling::X8 => 3,
-            Oversampling::X16 => 4,
-            Oversampling::X32 => 5,
-        }
+/// Map the logical [`Oversampling`] to its OSR register field code (`log2(factor)`, 0..=5). Values
+/// per the Bosch BMP3 datasheet (`bmp3_defs.h` `BMP3_OVERSAMPLING_*`).
+const fn osr_reg(osr: Oversampling) -> u8 {
+    match osr {
+        Oversampling::X1 => 0,
+        Oversampling::X2 => 1,
+        Oversampling::X4 => 2,
+        Oversampling::X8 => 3,
+        Oversampling::X16 => 4,
+        Oversampling::X32 => 5,
     }
-}
-
-/// `configure` rejects an ODR too fast for the chosen oversampling (Bosch timing rule).
-#[derive(Debug)]
-pub enum ConfigError {
-    OdrTooFast,
-}
-
-/// One compensated sample.
-pub struct BaroSample {
-    pub pressure_hpa: f32,
-    pub temp_c: f32,
 }
 
 /// Float-scaled calibration coefficients, per Bosch `parse_calib_data` (quantized form).
@@ -134,12 +92,12 @@ struct Calib {
     p11: f64,
 }
 
-pub struct Baro {
+pub struct Bmp3xx {
     regs: I2cRegs<I2c2>,
     calib: Calib,
 }
 
-impl Baro {
+impl Bmp3xx {
     /// Take ownership of the configured I2C2 bus. Calibration is zeroed until
     /// [`read_calibration`](Self::read_calibration) runs.
     pub fn new(i2c: I2c2) -> Self {
@@ -155,15 +113,6 @@ impl Baro {
 
     fn write_reg(&mut self, reg: u8, val: u8) {
         self.regs.write_reg(reg, val);
-    }
-
-    pub fn chip_id(&mut self) -> u8 {
-        self.regs.read_reg(REG_CHIP_ID)
-    }
-
-    /// Soft-reset to a known state. Caller must wait ~2 ms afterwards.
-    pub fn soft_reset(&mut self) {
-        self.write_reg(REG_CMD, CMD_SOFT_RESET);
     }
 
     /// Read the 21-byte NVM trimming block and scale it to floating-point coefficients.
@@ -190,19 +139,19 @@ impl Baro {
 
         // Quantized calibration: raw / 2^k (see BMP3_SensorAPI). Powers of two as exact f64.
         self.calib = Calib {
-            t1: t1 as f64 / 0.003_906_25,           // / 2^-8  (= * 256)
-            t2: t2 as f64 / 1_073_741_824.0,         // / 2^30
-            t3: t3 as f64 / 281_474_976_710_656.0,   // / 2^48
-            p1: (p1 as f64 - 16_384.0) / 1_048_576.0, // / 2^20
-            p2: (p2 as f64 - 16_384.0) / 536_870_912.0, // / 2^29
-            p3: p3 as f64 / 4_294_967_296.0,         // / 2^32
-            p4: p4 as f64 / 137_438_953_472.0,       // / 2^37
-            p5: p5 as f64 / 0.125,                   // / 2^-3  (= * 8)
-            p6: p6 as f64 / 64.0,                    // / 2^6
-            p7: p7 as f64 / 256.0,                   // / 2^8
-            p8: p8 as f64 / 32_768.0,                // / 2^15
-            p9: p9 as f64 / 281_474_976_710_656.0,   // / 2^48
-            p10: p10 as f64 / 281_474_976_710_656.0, // / 2^48
+            t1: t1 as f64 / 0.003_906_25,                   // / 2^-8  (= * 256)
+            t2: t2 as f64 / 1_073_741_824.0,                // / 2^30
+            t3: t3 as f64 / 281_474_976_710_656.0,          // / 2^48
+            p1: (p1 as f64 - 16_384.0) / 1_048_576.0,       // / 2^20
+            p2: (p2 as f64 - 16_384.0) / 536_870_912.0,     // / 2^29
+            p3: p3 as f64 / 4_294_967_296.0,                // / 2^32
+            p4: p4 as f64 / 137_438_953_472.0,              // / 2^37
+            p5: p5 as f64 / 0.125,                          // / 2^-3  (= * 8)
+            p6: p6 as f64 / 64.0,                           // / 2^6
+            p7: p7 as f64 / 256.0,                          // / 2^8
+            p8: p8 as f64 / 32_768.0,                       // / 2^15
+            p9: p9 as f64 / 281_474_976_710_656.0,          // / 2^48
+            p10: p10 as f64 / 281_474_976_710_656.0,        // / 2^48
             p11: p11 as f64 / 36_893_488_147_419_103_232.0, // / 2^65
         };
     }
@@ -217,22 +166,41 @@ impl Baro {
         osr_t: Oversampling,
     ) -> Result<(), ConfigError> {
         let meas_us = MEAS_BASE_US
-            + (SETTLE_PRESS_US + (1 << osr_p.reg()) * ADC_CONV_US)
-            + (SETTLE_TEMP_US + (1 << osr_t.reg()) * ADC_CONV_US);
+            + (SETTLE_PRESS_US + osr_p.factor() * ADC_CONV_US)
+            + (SETTLE_TEMP_US + osr_t.factor() * ADC_CONV_US);
         if meas_us >= odr.period_us() {
             return Err(ConfigError::OdrTooFast);
         }
-        self.write_reg(REG_OSR, (osr_t.reg() << 3) | osr_p.reg());
-        self.write_reg(REG_ODR, odr.reg());
+        self.write_reg(REG_OSR, (osr_reg(osr_t) << 3) | osr_reg(osr_p));
+        self.write_reg(REG_ODR, odr_reg(odr));
         self.write_reg(REG_PWR_CTRL, PWR_CTRL_NORMAL);
         Ok(())
     }
+}
 
+impl Identify for Bmp3xx {
+    fn read_id(&mut self) -> u8 {
+        self.regs.read_reg(REG_CHIP_ID)
+    }
+
+    fn id_matches(id: u8) -> bool {
+        id == CHIP_ID_BMP388 || id == CHIP_ID_BMP390
+    }
+}
+
+impl SoftReset for Bmp3xx {
+    /// Soft-reset to a known state. Caller must wait ~2 ms afterwards.
+    fn soft_reset(&mut self) {
+        self.write_reg(REG_CMD, CMD_SOFT_RESET);
+    }
+}
+
+impl Baro for Bmp3xx {
     /// Full polled bring-up: soft-reset, settle, load factory calibration, start normal-mode
     /// sampling, then wait for the first conversion. Encapsulates the reset/settle timing so the
     /// caller only supplies an async millisecond delay (e.g. `|ms| Mono::delay(ms.millis())`).
     /// Returns `Err(OdrTooFast)` straight from [`configure`](Self::configure).
-    pub async fn bring_up<F, Fut>(
+    async fn bring_up<F, Fut>(
         &mut self,
         odr: BaroOdr,
         osr_p: Oversampling,
@@ -252,7 +220,7 @@ impl Baro {
     }
 
     /// Read the latest sample and apply Bosch float compensation.
-    pub fn read(&mut self) -> BaroSample {
+    fn read(&mut self) -> BaroSample {
         let mut b = [0u8; 6];
         self.read_regs(REG_DATA, &mut b);
         // 24-bit, little-endian: XLSB, LSB, MSB.
@@ -268,7 +236,8 @@ impl Baro {
 
         // compensate_pressure (Pa)
         let o1 = c.p5 + c.p6 * t_lin + c.p7 * t_lin * t_lin + c.p8 * t_lin * t_lin * t_lin;
-        let o2 = adc_p * (c.p1 + c.p2 * t_lin + c.p3 * t_lin * t_lin + c.p4 * t_lin * t_lin * t_lin);
+        let o2 =
+            adc_p * (c.p1 + c.p2 * t_lin + c.p3 * t_lin * t_lin + c.p4 * t_lin * t_lin * t_lin);
         let o3 = adc_p * adc_p * (c.p9 + c.p10 * t_lin) + adc_p * adc_p * adc_p * c.p11;
         let pressure_pa = o1 + o2 + o3;
 

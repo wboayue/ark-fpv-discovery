@@ -22,8 +22,7 @@ use fusion_ahrs::{Ahrs, AhrsSettings, Convention};
 use fusion_altitude::{AltitudeEstimator, AltitudeSettings, GRAVITY};
 
 use crate::config;
-use crate::imu::ImuSample;
-use crate::mag::MagSample;
+use crate::sensors::{ImuSample, MagSample};
 
 /// Fused estimate. Flat and `Copy` so it drops straight into a `#[shared]` resource and the
 /// logger. Angles in degrees, altitude in metres, velocity in m/s.
@@ -75,8 +74,16 @@ impl SensorState {
         }
         let inv = 1.0 / self.n as f32;
         let mean = ImuSample {
-            accel_g: [self.accel_sum[0] * inv, self.accel_sum[1] * inv, self.accel_sum[2] * inv],
-            gyro_dps: [self.gyro_sum[0] * inv, self.gyro_sum[1] * inv, self.gyro_sum[2] * inv],
+            accel_g: [
+                self.accel_sum[0] * inv,
+                self.accel_sum[1] * inv,
+                self.accel_sum[2] * inv,
+            ],
+            gyro_dps: [
+                self.gyro_sum[0] * inv,
+                self.gyro_sum[1] * inv,
+                self.gyro_sum[2] * inv,
+            ],
             temp_c: self.temp_sum * inv,
         };
         self.gyro_sum = [0.0; 3];

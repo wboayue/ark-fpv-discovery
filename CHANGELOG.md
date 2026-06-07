@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Sensor **role layer** in `src/sensors.rs`: role traits `Imu`/`Baro`/`Mag` plus horizontal `Identify`/`SoftReset`, defined against lifted contract types and implemented by each concrete driver. Sets up making `fusion` generic over `impl Imu/Baro/Mag` (swappable sensors) in a follow-up.
+
+### Changed
+
+- Sensor drivers grouped under a `sensors` module: `src/{imu,baro,mag}.rs` → `src/sensors/{imu,baro,mag}.rs` (role-named module = role slot). Driver structs renamed to their parts — `Imu`/`Baro`/`Mag` → `Iim42653`/`Bmp3xx`/`Lis2mdl` — so the role names belong to the traits. No driver logic changed.
+- Contract types (`ImuSample`/`BaroSample`/`MagSample`, `ImuOdr`/`BaroOdr`/`Oversampling`/`MagOdr`, `ConfigError`) lifted from the individual drivers into the `sensors` role layer; each driver maps the logical config enums to its own chip registers privately (`odr_reg`/`osr_reg`). No behaviour change.
+
 ## [0.3.0] - 2026-06-03
 
 ### Added
