@@ -19,7 +19,7 @@ use discovery_telemetry as wire;
 use heapless::String;
 use rtic::Mutex;
 use rtic_monotonics::Monotonic; // brings `Mono::now()` / `.ticks()` into scope
-use stm32h7xx_hal::usb_hs::{UsbBus, USB2};
+use stm32h7xx_hal::usb_hs::{USB2, UsbBus};
 use usbd_serial::SerialPort;
 
 use crate::fusion::FusedState;
@@ -101,7 +101,10 @@ pub fn log_fmt(serial: &mut impl SerialMutex, args: core::fmt::Arguments) {
 /// naming it, so no direct `postcard`/`serde` dependency leaks in.
 pub fn encode_frame(msg: wire::Msg, buf: &mut [u8; wire::codec::MAX_FRAME]) -> Option<&[u8]> {
     // Mono is 1 kHz → ticks are ms; `ticks()` is u32 here, matching Frame.t_ms.
-    let frame = wire::Frame { t_ms: Mono::now().ticks(), msg };
+    let frame = wire::Frame {
+        t_ms: Mono::now().ticks(),
+        msg,
+    };
     wire::codec::encode(&frame, buf).ok().map(|w| &*w)
 }
 
@@ -153,20 +156,36 @@ pub fn emit_line(serial: &mut impl SerialMutex, level: wire::Level, args: core::
 pub fn log_imu(serial: &mut impl SerialMutex, n: u32, id: u8, exp: u8, s: &ImuSample) {
     if output_is_binary() {
         if n == config::IMU_LOG_DIV {
-            emit_frame(serial, status_msg(wire::Level::Info, format_args!("imu id=0x{id:02x} (exp {exp:02x})")));
+            emit_frame(
+                serial,
+                status_msg(
+                    wire::Level::Info,
+                    format_args!("imu id=0x{id:02x} (exp {exp:02x})"),
+                ),
+            );
         }
         emit_frame(
             serial,
-            wire::Msg::Imu(wire::Imu { accel_g: s.accel_g, gyro_dps: s.gyro_dps, temp_c: s.temp_c }),
+            wire::Msg::Imu(wire::Imu {
+                accel_g: s.accel_g,
+                gyro_dps: s.gyro_dps,
+                temp_c: s.temp_c,
+            }),
         );
     } else {
         log_fmt(
             serial,
             format_args!(
                 "imu[{}] id=0x{:02x}(exp {:02x}) accel[g]={:.2},{:.2},{:.2} gyro[dps]={:.1},{:.1},{:.1} temp={:.1}C\r\n",
-                n, id, exp,
-                s.accel_g[0], s.accel_g[1], s.accel_g[2],
-                s.gyro_dps[0], s.gyro_dps[1], s.gyro_dps[2],
+                n,
+                id,
+                exp,
+                s.accel_g[0],
+                s.accel_g[1],
+                s.accel_g[2],
+                s.gyro_dps[0],
+                s.gyro_dps[1],
+                s.gyro_dps[2],
                 s.temp_c,
             ),
         );
@@ -176,9 +195,21 @@ pub fn log_imu(serial: &mut impl SerialMutex, n: u32, id: u8, exp: u8, s: &ImuSa
 /// Emit one barometer sample: a `Baro` frame in binary mode, the concise `baro …` text otherwise.
 pub fn log_baro(serial: &mut impl SerialMutex, s: &BaroSample) {
     if output_is_binary() {
-        emit_frame(serial, wire::Msg::Baro(wire::Baro { pressure_hpa: s.pressure_hpa, temp_c: s.temp_c }));
+        emit_frame(
+            serial,
+            wire::Msg::Baro(wire::Baro {
+                pressure_hpa: s.pressure_hpa,
+                temp_c: s.temp_c,
+            }),
+        );
     } else {
-        log_fmt(serial, format_args!("baro press={:.2}hPa temp={:.2}C\r\n", s.pressure_hpa, s.temp_c));
+        log_fmt(
+            serial,
+            format_args!(
+                "baro press={:.2}hPa temp={:.2}C\r\n",
+                s.pressure_hpa, s.temp_c
+            ),
+        );
     }
 }
 
@@ -186,7 +217,13 @@ pub fn log_baro(serial: &mut impl SerialMutex, s: &BaroSample) {
 /// (The verbose register dump stays in the task — it reads live config registers.)
 pub fn log_mag(serial: &mut impl SerialMutex, s: &MagSample) {
     if output_is_binary() {
-        emit_frame(serial, wire::Msg::Mag(wire::Mag { field_ut: s.field_ut, temp_c: s.temp_c }));
+        emit_frame(
+            serial,
+            wire::Msg::Mag(wire::Mag {
+                field_ut: s.field_ut,
+                temp_c: s.temp_c,
+            }),
+        );
     } else {
         log_fmt(
             serial,

@@ -134,7 +134,6 @@ impl Lis2mdl {
         self.read_regs(REG_CFG_A, &mut b); // 0x60..=0x62 auto-increment
         (b[0], b[1], b[2])
     }
-
 }
 
 impl Identify for Lis2mdl {

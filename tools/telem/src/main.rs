@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use discovery_telemetry::{codec::Decoder, Board, Frame, Level, Msg, PROTOCOL_VERSION};
+use discovery_telemetry::{Board, Frame, Level, Msg, PROTOCOL_VERSION, codec::Decoder};
 use serialport::SerialPortType;
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -60,7 +60,8 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening {port_name}"))?;
 
     if !args.no_switch {
-        port.write_all(b"b").context("sending 'b' (switch to binary)")?;
+        port.write_all(b"b")
+            .context("sending 'b' (switch to binary)")?;
         port.flush().ok();
         eprintln!(
             "telem: sent 'b' — decoding frames (Ctrl-C to quit; firmware reverts to text on close)"
@@ -116,10 +117,19 @@ fn print_frame(f: &Frame) {
         Msg::Tick(n) => println!("[{t:>8}] tick {n}"),
         Msg::Imu(s) => println!(
             "[{t:>8}] imu accel[g]={:.2},{:.2},{:.2} gyro[dps]={:.1},{:.1},{:.1} temp={:.1}C",
-            s.accel_g[0], s.accel_g[1], s.accel_g[2], s.gyro_dps[0], s.gyro_dps[1], s.gyro_dps[2], s.temp_c
+            s.accel_g[0],
+            s.accel_g[1],
+            s.accel_g[2],
+            s.gyro_dps[0],
+            s.gyro_dps[1],
+            s.gyro_dps[2],
+            s.temp_c
         ),
         Msg::Baro(s) => {
-            println!("[{t:>8}] baro press={:.2}hPa temp={:.2}C", s.pressure_hpa, s.temp_c)
+            println!(
+                "[{t:>8}] baro press={:.2}hPa temp={:.2}C",
+                s.pressure_hpa, s.temp_c
+            )
         }
         Msg::Mag(s) => println!(
             "[{t:>8}] mag field[uT]={:.1},{:.1},{:.1} temp={:.1}C",
@@ -127,7 +137,12 @@ fn print_frame(f: &Frame) {
         ),
         Msg::Fused(s) => println!(
             "[{t:>8}] fus roll={:.1} pitch={:.1} yaw={:.1}deg alt={:.2}m vz={:.2}m/s resid={:.2}m",
-            s.roll_deg, s.pitch_deg, s.yaw_deg, s.altitude_m, s.vertical_speed_mps, s.baro_residual_m
+            s.roll_deg,
+            s.pitch_deg,
+            s.yaw_deg,
+            s.altitude_m,
+            s.vertical_speed_mps,
+            s.baro_residual_m
         ),
         Msg::Status(s) => {
             let lvl = match s.level {

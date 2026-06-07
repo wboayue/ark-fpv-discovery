@@ -74,8 +74,16 @@ impl SensorState {
         }
         let inv = 1.0 / self.n as f32;
         let mean = ImuSample {
-            accel_g: [self.accel_sum[0] * inv, self.accel_sum[1] * inv, self.accel_sum[2] * inv],
-            gyro_dps: [self.gyro_sum[0] * inv, self.gyro_sum[1] * inv, self.gyro_sum[2] * inv],
+            accel_g: [
+                self.accel_sum[0] * inv,
+                self.accel_sum[1] * inv,
+                self.accel_sum[2] * inv,
+            ],
+            gyro_dps: [
+                self.gyro_sum[0] * inv,
+                self.gyro_sum[1] * inv,
+                self.gyro_sum[2] * inv,
+            ],
             temp_c: self.temp_sum * inv,
         };
         self.gyro_sum = [0.0; 3];

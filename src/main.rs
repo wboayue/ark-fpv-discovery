@@ -17,13 +17,10 @@ use hal::{
     pac,
     prelude::*,
     rcc::rec::UsbClkSel,
-    usb_hs::{UsbBus, USB2},
+    usb_hs::{USB2, UsbBus},
 };
 
-use usb_device::{
-    bus::UsbBusAllocator,
-    prelude::*,
-};
+use usb_device::{bus::UsbBusAllocator, prelude::*};
 
 use usbd_serial::SerialPort;
 
@@ -84,8 +81,8 @@ mod app {
     use discovery_telemetry as wire;
     // Serial output layer: text logging, binary framing, and the output-mode / diagnostic flags.
     use crate::telemetry::{
-        diag_enabled, emit_frame, emit_line, fw_git, log_baro, log_fmt, log_fused, log_imu, log_mag,
-        output_is_binary, set_output_binary, status_msg, toggle_diag, write_frame,
+        diag_enabled, emit_frame, emit_line, fw_git, log_baro, log_fmt, log_fused, log_imu,
+        log_mag, output_is_binary, set_output_binary, status_msg, toggle_diag, write_frame,
     };
 
     // Status LED indices into `Local::leds` — ARK FPV board pins PE3/PE4/PE5.
@@ -153,9 +150,18 @@ mod app {
         // Status LEDs: red=PE3, green=PE4, blue=PE5. These are active-low on the
         // ARK FPV (pin LOW = lit), so start all three HIGH (off). log_tick blinks green.
         let leds = [
-            gpioe.pe3.into_push_pull_output_in_state(PinState::High).erase(),
-            gpioe.pe4.into_push_pull_output_in_state(PinState::High).erase(),
-            gpioe.pe5.into_push_pull_output_in_state(PinState::High).erase(),
+            gpioe
+                .pe3
+                .into_push_pull_output_in_state(PinState::High)
+                .erase(),
+            gpioe
+                .pe4
+                .into_push_pull_output_in_state(PinState::High)
+                .erase(),
+            gpioe
+                .pe5
+                .into_push_pull_output_in_state(PinState::High)
+                .erase(),
         ];
 
         // IIM-42653 IMU on SPI1: SCK=PA5, MISO=PG9, MOSI=PB5 (all AF5), soft CS=PI9.
@@ -256,8 +262,22 @@ mod app {
         // The IMU loop is driven by the DRDY interrupt (EXTI2), not spawned here.
 
         (
-            Shared { usb_dev, serial, latest: SensorState::default(), fused: FusedState::default() },
-            Local { counter: 0, leds, imu, imu_drdy, imu_id, baro, mag, fusion },
+            Shared {
+                usb_dev,
+                serial,
+                latest: SensorState::default(),
+                fused: FusedState::default(),
+            },
+            Local {
+                counter: 0,
+                leds,
+                imu,
+                imu_drdy,
+                imu_id,
+                baro,
+                mag,
+                fusion,
+            },
         )
     }
 
@@ -314,7 +334,8 @@ mod app {
                                     ),
                                 );
                             } else {
-                                let _ = serial.write(if on { b"diag on\r\n" } else { b"diag off\r\n" });
+                                let _ =
+                                    serial.write(if on { b"diag on\r\n" } else { b"diag off\r\n" });
                             }
                         }
                     }
@@ -349,7 +370,10 @@ mod app {
             } else {
                 log_fmt(
                     &mut cx.shared.serial,
-                    format_args!("hello from RTIC on STM32H743, tick {}\r\n", *cx.local.counter),
+                    format_args!(
+                        "hello from RTIC on STM32H743, tick {}\r\n",
+                        *cx.local.counter
+                    ),
                 );
             }
 
@@ -374,7 +398,7 @@ mod app {
         cx.shared.latest.lock(|st| st.accumulate(&s));
         // (control step goes here)
         *cx.local.n = cx.local.n.wrapping_add(1);
-        if *cx.local.n % config::IMU_LOG_DIV == 0 {
+        if (*cx.local.n).is_multiple_of(config::IMU_LOG_DIV) {
             imu_log::spawn(*cx.local.n, *cx.local.imu_id, s).ok();
         }
     }
@@ -383,7 +407,13 @@ mod app {
     // `n` is the DRDY count (confirms the real loop rate); `id` is the WHO_AM_I read at startup.
     #[task(shared = [serial])]
     async fn imu_log(mut cx: imu_log::Context, n: u32, id: u8, s: ImuSample) {
-        log_imu(&mut cx.shared.serial, n, id, crate::sensors::imu::EXPECTED_WHO_AM_I, &s);
+        log_imu(
+            &mut cx.shared.serial,
+            n,
+            id,
+            crate::sensors::imu::EXPECTED_WHO_AM_I,
+            &s,
+        );
     }
 
     // Bring up the BMP388/BMP390 barometer (polled) and stream pressure/temp. Sample rate and
@@ -406,9 +436,12 @@ mod app {
 
         // Reset, load calibration, and start normal-mode sampling (driver owns the timing).
         if baro
-            .bring_up(config::BARO_ODR, config::BARO_OSR_P, config::BARO_OSR_T, |ms| {
-                Mono::delay(ms.millis())
-            })
+            .bring_up(
+                config::BARO_ODR,
+                config::BARO_OSR_P,
+                config::BARO_OSR_T,
+                |ms| Mono::delay(ms.millis()),
+            )
             .await
             .is_err()
         {
@@ -429,7 +462,7 @@ mod app {
             // Stash raw pressure for fusion; the pressure→altitude conversion stays in fusion.rs.
             cx.shared.latest.lock(|st| st.set_pressure(s.pressure_hpa));
 
-            if n % config::BARO_LOG_DIV == 0 {
+            if n.is_multiple_of(config::BARO_LOG_DIV) {
                 log_baro(&mut cx.shared.serial, &s);
             }
 
@@ -447,7 +480,11 @@ mod app {
         let matched = Lis2mdl::id_matches(id);
         emit_line(
             &mut cx.shared.serial,
-            if matched { wire::Level::Info } else { wire::Level::Warn },
+            if matched {
+                wire::Level::Info
+            } else {
+                wire::Level::Warn
+            },
             format_args!(
                 "mag WHO_AM_I=0x{:02x}(exp {:02x}) {}",
                 id,
@@ -457,7 +494,10 @@ mod app {
         );
 
         // Reset and enter continuous mode (driver owns the reset-wait + continuous-latch retries).
-        if !mag.bring_up(config::MAG_ODR, |ms| Mono::delay(ms.millis())).await {
+        if !mag
+            .bring_up(config::MAG_ODR, |ms| Mono::delay(ms.millis()))
+            .await
+        {
             emit_line(
                 &mut cx.shared.serial,
                 wire::Level::Error,
@@ -475,7 +515,7 @@ mod app {
             // Stash the latest field for fusion (MagSample is Copy, so `s` is still usable below).
             cx.shared.latest.lock(|state| state.set_mag(s));
 
-            if n % config::MAG_LOG_DIV == 0 {
+            if n.is_multiple_of(config::MAG_LOG_DIV) {
                 // Text + diag: verbose register dump (reads live config regs, so it stays here).
                 // Otherwise (binary, or text without diag) render the sample via the helper.
                 if !output_is_binary() && diag_enabled() {
@@ -485,7 +525,15 @@ mod app {
                         &mut cx.shared.serial,
                         format_args!(
                             "mag[diag] id=0x{:02x} cfgA=0x{:02x} B=0x{:02x} C=0x{:02x} field[uT]={:.1},{:.1},{:.1} temp={:.1}C status=0x{:02x}\r\n",
-                            id, ca, cb, cc, s.field_ut[0], s.field_ut[1], s.field_ut[2], s.temp_c, st
+                            id,
+                            ca,
+                            cb,
+                            cc,
+                            s.field_ut[0],
+                            s.field_ut[1],
+                            s.field_ut[2],
+                            s.temp_c,
+                            st
                         ),
                     );
                 } else {
@@ -529,7 +577,7 @@ mod app {
                 cx.shared.fused.lock(|f| *f = state);
 
                 *cx.local.n = cx.local.n.wrapping_add(1);
-                if *cx.local.n % config::FUSION_LOG_DIV == 0 {
+                if (*cx.local.n).is_multiple_of(config::FUSION_LOG_DIV) {
                     // Text + diag: verbose vertical-channel dump for characterizing the baro
                     // disturbance (e.g. props-on) — `resid` is the baro innovation an adaptive-trust
                     // scheme would gate on (sizes `r0`); `vacc` shows accel/vibration coupling;
