@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Sensor **role layer** in `src/sensors.rs`: role traits `Imu`/`Baro`/`Mag` plus horizontal `Identify`/`SoftReset`, defined against lifted contract types and implemented by each concrete driver. Sets up making `fusion` generic over `impl Imu/Baro/Mag` (swappable sensors) in a follow-up.
+- Sensor **role layer** in `src/sensors.rs`: role traits `Imu`/`Baro`/`Mag` plus horizontal `Identify`/`SoftReset`, defined against lifted contract types and implemented by each concrete driver.
+- Per-role driver aliases `ImuDriver`/`BaroDriver`/`MagDriver` in `sensors.rs` as the swappable-sensor seam: consumers (`main`'s `#[local]` resources + sensor tasks) reference the alias, never the part struct, so swapping a chip is an alias change plus its new driver module.
 
 ### Changed
 

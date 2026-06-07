@@ -73,11 +73,12 @@ fn maybe_enter_bootloader() {
 mod app {
     use super::*;
     use crate::fusion::{FusedState, Fusion, SensorState};
-    use crate::sensors::baro::{Bmp3xx, CHIP_ID_BMP388, CHIP_ID_BMP390};
-    use crate::sensors::imu::Iim42653;
-    use crate::sensors::mag::Lis2mdl;
-    // Role + horizontal traits, in scope so their methods are callable on the concrete drivers.
-    use crate::sensors::{Baro, Identify, Imu, ImuSample, Mag, SoftReset};
+    use crate::sensors::baro::{CHIP_ID_BMP388, CHIP_ID_BMP390};
+    // Per-role driver aliases (the swap seam) + the role/horizontal traits, in scope so their
+    // methods are callable on the concrete drivers.
+    use crate::sensors::{
+        Baro, BaroDriver, Identify, Imu, ImuDriver, ImuSample, Mag, MagDriver, SoftReset,
+    };
     use discovery_telemetry as wire;
     // Serial output layer: text logging, binary framing, and the output-mode / diagnostic flags.
     use crate::telemetry::{
@@ -106,11 +107,11 @@ mod app {
     struct Local {
         counter: u32,
         leds: [ErasedPin<Output<PushPull>>; 3],
-        imu: Iim42653,
+        imu: ImuDriver,
         imu_drdy: ErasedPin<Input>,
         imu_id: u8,
-        baro: Bmp3xx,
-        mag: Lis2mdl,
+        baro: BaroDriver,
+        mag: MagDriver,
         fusion: Fusion,
     }
 
@@ -177,7 +178,7 @@ mod app {
             ccdr.peripheral.SPI1,
             &ccdr.clocks,
         );
-        let mut imu = Iim42653::new(spi, gpioi.pi9.into_push_pull_output().erase());
+        let mut imu = ImuDriver::new(spi, gpioi.pi9.into_push_pull_output().erase());
         // Control-mode bring-up: reset, brief settle (~2 ms @ 400 MHz), then configure ODR,
         // filtering, and DRDY-on-INT1. The gyro takes ~50 ms to start — DRDY simply won't fire
         // until then, so no explicit wait is needed here.
@@ -205,7 +206,7 @@ mod app {
             ccdr.peripheral.I2C2,
             &ccdr.clocks,
         );
-        let baro = Bmp3xx::new(i2c);
+        let baro = BaroDriver::new(i2c);
 
         // IIS2MDC/LIS2MDL magnetometer on I2C4: SCL=PF14, SDA=PF15 (AF4, open-drain). Like I2C2,
         // no kernel-clock setup needed — I2C4 runs off pclk4 (APB4/D3), always live after freeze().
@@ -218,7 +219,7 @@ mod app {
             ccdr.peripheral.I2C4,
             &ccdr.clocks,
         );
-        let mag = Lis2mdl::new(i2c4);
+        let mag = MagDriver::new(i2c4);
 
         // Sensor fusion (attitude + altitude). Owned by the fusion_step task; fed by the latest
         // IMU/mag/baro samples. 9-DOF vs 6-DOF is config::FUSION_USE_MAG.
@@ -477,7 +478,7 @@ mod app {
         let mag = cx.local.mag;
 
         let id = mag.read_id();
-        let matched = Lis2mdl::id_matches(id);
+        let matched = MagDriver::id_matches(id);
         emit_line(
             &mut cx.shared.serial,
             if matched {
