@@ -29,6 +29,21 @@ pub(crate) mod imu;
 pub(crate) mod mag;
 
 // =============================================================================
+// Driver selection — the one place that names the concrete chip per role.
+// =============================================================================
+
+// Consumers (`main`'s `#[local]` resources, the sensor tasks) reference these aliases, never the
+// part struct — so swapping a chip is a one-line change here (plus its new driver module). The
+// tasks can't be generic over the role traits (the `#[rtic::app]` macro needs concrete `#[local]`
+// types, and the mag task uses inherent `status`/`read_cfg` diagnostics that aren't on `Mag`), and
+// after the role-layer split the chip-specific logic already lives inside the trait methods — so an
+// alias, not `impl Trait`, is the swap seam. `fusion` consumes the sample contract types, not
+// drivers, so it's unaffected.
+pub(crate) type ImuDriver = imu::Iim42653;
+pub(crate) type BaroDriver = baro::Bmp3xx;
+pub(crate) type MagDriver = mag::Lis2mdl;
+
+// =============================================================================
 // Contract types — the role layer's vocabulary (units + logical config).
 // =============================================================================
 
